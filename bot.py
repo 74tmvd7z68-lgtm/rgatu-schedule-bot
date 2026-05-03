@@ -12,9 +12,14 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.bot import DefaultBotProperties
+from aiohttp import web
 
+# Загрузка переменных окружения
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+PORT = int(os.environ.get('PORT', 8080))
 
 # --- КОНСТАНТЫ ---
 UNIVERSITY_URL = "https://www.rsatu.ru"
@@ -39,6 +44,10 @@ class States(StatesGroup):
     waiting_for_teacher_name = State()
     waiting_for_teacher_day = State()
     waiting_for_day = State()
+    waiting_for_reset = State()
+    waiting_for_student_teacher_search = State()
+    waiting_for_student_teacher_week = State()
+    waiting_for_student_teacher_day = State()
 
 # --- ХРАНЕНИЕ ДАННЫХ ПОЛЬЗОВАТЕЛЕЙ ---
 user_data = {}
@@ -210,7 +219,8 @@ class ScheduleMaster:
         self.last_update = None
     
     async def start(self):
-        self.session = aiohttp.ClientSession()
+        timeout = aiohttp.ClientTimeout(total=60, connect=30, sock_read=30)
+        self.session = aiohttp.ClientSession(timeout=timeout)
     
     async def stop(self):
         if self.session:
@@ -218,7 +228,7 @@ class ScheduleMaster:
     
     async def fetch_page(self, url):
         try:
-            async with self.session.get(url, timeout=15, ssl=False) as response:
+            async with self.session.get(url, timeout=30, ssl=False) as response:
                 return await response.text() if response.status == 200 else None
         except Exception as e:
             print(f"Ошибка загрузки {url}: {e}")
@@ -247,11 +257,10 @@ class ScheduleMaster:
     
     async def download_excel(self, url):
         try:
-            async with self.session.get(url, timeout=30, ssl=False) as response:
+            async with self.session.get(url, timeout=60, ssl=False) as response:
                 if response.status == 200:
                     return await response.read()
                 else:
-                    print(f"Ошибка скачивания: статус {response.status}")
                     return None
         except Exception as e:
             print(f"Ошибка скачивания: {e}")
@@ -497,8 +506,6 @@ class ScheduleMaster:
             
         except Exception as e:
             print(f"❌ Ошибка загрузки: {str(e)}")
-            import traceback
-            traceback.print_exc()
             return False, f"❌ Ошибка: {str(e)}"
     
     async def load_correspondence_data(self):
@@ -523,7 +530,6 @@ class ScheduleMaster:
             dfs_cache[sheet_name] = df
             
             print(f"\n🔍 ПОИСК ЗАГОЛОВКОВ ГРУПП ЗАОЧНИКОВ")
-            print(f"📊 Размер файла: {len(df)} строк, {len(df.columns)} столбцов")
             
             group_columns = {}
             for col_idx in range(len(df.columns)):
@@ -551,10 +557,6 @@ class ScheduleMaster:
                                     group_columns[group_name] = col_idx
                                     group_positions[group_name] = (sheet_name, row_idx, col_idx)
                                     print(f"✅ Найдена группа в строке {row_idx}: {group_name}")
-            
-            print(f"\n📋 Найдено групп заочников: {len(groups_found)}")
-            for g in groups_found:
-                print(f"   - {g}")
             
             for group_name, col_idx in group_columns.items():
                 lessons_by_group[group_name] = {}
@@ -594,304 +596,92 @@ class ScheduleMaster:
             
             print(f"\n✅ Заочники: загружено {len(self.correspondence_groups)} групп")
             
-            return True, f"✅ Заочники: {len(self.correspondence_groups)} групп"
+            return True, f"✅ Заочники: {len(self.correspondence_groups)} Gruppen"
             
         except Exception as e:
             print(f"❌ Ошибка загрузки заочников: {str(e)}")
-            import traceback
-            traceback.print_exc()
             return False, f"❌ Ошибка: {str(e)}"
     
     async def load_consultations(self):
-        """Загрузка консультаций из файла"""
         try:
             _, cons_url = await self.find_correspondence_links()
-            print(f"🔍 Найден URL консультаций: {cons_url}")
-            
             if not cons_url:
                 cons_url = FALLBACK_CONSULTATIONS_URL
                 print(f"⚠️ Использую запасную ссылку: {cons_url}")
             
-            print(f"📥 Скачиваю файл: {cons_url}")
             file_content = await self.download_excel(cons_url)
-            
             if not file_content:
-                print("❌ Не удалось скачать файл консультаций")
+                print("Не удалось скачать файл консультаций")
                 return
             
-            print(f"✅ Файл скачан, размер: {len(file_content)} байт")
-            
             xl = pd.ExcelFile(io.BytesIO(file_content))
-            print(f"📊 Листы в файле: {xl.sheet_names}")
-            
-            # Используем первый лист "Консультации (группы)"
             df = pd.read_excel(xl, sheet_name=0, header=None, dtype=str)
             
             consultations_by_group = {}
             
-            print(f"\n🔍 ЗАГРУЗКА КОНСУЛЬТАЦИЙ")
-            print(f"📊 Размер файла: {len(df)} строк, {len(df.columns)} столбцов")
-            
-            # Показываем первые строки для отладки
-            print("\n📋 Содержимое файла консультаций:")
-            for i in range(min(20, len(df))):
-                row_str = f"Строка {i}: "
-                for j in range(min(len(df.columns), 8)):
-                    val = df.iat[i, j] if pd.notna(df.iat[i, j]) else ""
-                    if val:
-                        row_str += f" | [{j}]{str(val)[:50]}"
-                print(row_str)
-            
-            # Паттерны для поиска
             group_pattern = re.compile(r'([З3][А-Я]{2,3}-\d{2,3})', re.IGNORECASE)
-            # Паттерн для даты в формате YYYY-MM-DD
             date_pattern = re.compile(r'(\d{4}-\d{2}-\d{2})')
             time_pattern = re.compile(r'(\d{1,2}:\d{2})')
             
             current_date = None
-            processed_times = set()  # Для отслеживания уже обработанных времен
+            processed_times = set()
             
             for row_idx in range(len(df)):
-                # Читаем первый и второй столбцы
                 first_cell = str(df.iat[row_idx, 0]) if pd.notna(df.iat[row_idx, 0]) else ""
                 second_cell = str(df.iat[row_idx, 1]) if pd.notna(df.iat[row_idx, 1]) else ""
                 
-                # Проверяем, является ли первый столбец датой (формат YYYY-MM-DD)
                 date_match = date_pattern.search(first_cell)
                 if date_match:
                     current_date = date_match.group(1)
-                    # Преобразуем в формат DD.MM.YYYY
                     date_parts = current_date.split('-')
                     if len(date_parts) == 3:
                         current_date = f"{date_parts[2]}.{date_parts[1]}.{date_parts[0]}"
-                    print(f"📅 Строка {row_idx}: Найдена дата: {current_date}")
-                    processed_times.clear()  # Сбрасываем обработанные времена для новой даты
+                    processed_times.clear()
                     continue
                 
-                # Если нет даты, пропускаем строку
                 if not current_date:
                     continue
                 
-                # Получаем время из второго столбца
                 current_time = None
-                if second_cell and second_cell != 'nan':
-                    time_match = time_pattern.search(second_cell)
-                    if time_match:
-                        current_time = time_match.group(1)
-                        print(f"⏰ Строка {row_idx}: Найдено время: {current_time}, дата: {current_date}")
-                    else:
-                        # Если во втором столбце нет времени, пропускаем строку
-                        continue
+                if second_cell and second_cell != 'nan' and ':' in second_cell:
+                    current_time = second_cell.strip()
                 
                 if not current_time:
                     continue
                 
-                # Проверяем, не обрабатывали ли уже это время для текущей даты
                 time_key = f"{current_date}_{current_time}"
                 if time_key in processed_times:
-                    print(f"⚠️ Время {current_time} для даты {current_date} уже обработано, пропускаем")
                     continue
                 processed_times.add(time_key)
                 
-                # Обрабатываем столбцы с группами (начиная со 2-го)
                 for col_idx in range(2, len(df.columns)):
                     cell_value = str(df.iat[row_idx, col_idx]) if pd.notna(df.iat[row_idx, col_idx]) else ""
                     
                     if not cell_value or cell_value == 'nan' or cell_value == 'None':
                         continue
                     
-                    # Ищем группу в ячейке
                     group_match = group_pattern.search(cell_value)
                     if group_match:
                         group_name = group_match.group(1).upper()
-                        print(f"   ✅ Найдена группа: {group_name} в строке {row_idx}, колонке {col_idx}")
                         
-                        # Парсим содержимое ячейки
-                        consultation = self.parse_consultation_cell(cell_value, current_date, current_time)
+                        consultation = {
+                            'date': current_date,
+                            'time': current_time,
+                            'subject': cell_value[:50] if len(cell_value) > 50 else cell_value,
+                            'teacher': "",
+                            'room': ""
+                        }
                         
-                        if consultation and (consultation['subject'] or consultation['teacher']):
-                            if group_name not in consultations_by_group:
-                                consultations_by_group[group_name] = []
-                            # Проверяем, нет ли уже такой консультации (по времени и предмету)
-                            existing = False
-                            for existing_cons in consultations_by_group[group_name]:
-                                if existing_cons['time'] == current_time and existing_cons['subject'] == consultation['subject']:
-                                    existing = True
-                                    break
-                            if not existing:
-                                consultations_by_group[group_name].append(consultation)
-                                print(f"   ✅ Добавлена консультация для {group_name}: {current_date} {current_time}")
-                    else:
-                        # Проверяем на наличие групп без паттерна
-                        for test_group in ['ЗВС-22', 'ЗВС-23', 'ЗВС-24', 'ЗВС-25', 'ЗИС-22', 'ЗИС-23', 'ЗКС-22', 'ЗПС-22']:
-                            if test_group in cell_value:
-                                print(f"   ⚠️ Найдена группа {test_group} в строке {row_idx}, колонке {col_idx}")
-                                group_name = test_group
-                                consultation = self.parse_consultation_cell(cell_value, current_date, current_time)
-                                if consultation and (consultation['subject'] or consultation['teacher']):
-                                    if group_name not in consultations_by_group:
-                                        consultations_by_group[group_name] = []
-                                    # Проверяем, нет ли уже такой консультации
-                                    existing = False
-                                    for existing_cons in consultations_by_group[group_name]:
-                                        if existing_cons['time'] == current_time and existing_cons['subject'] == consultation['subject']:
-                                            existing = True
-                                            break
-                                    if not existing:
-                                        consultations_by_group[group_name].append(consultation)
-                                        print(f"   ✅ Добавлена консультация для {group_name} (ручное определение)")
-                                break
+                        if group_name not in consultations_by_group:
+                            consultations_by_group[group_name] = []
+                        consultations_by_group[group_name].append(consultation)
+                        print(f"   ✅ Добавлена консультация для {group_name}")
             
             self.consultations = consultations_by_group
-            print(f"\n✅ Загружено консультаций для {len(self.consultations)} групп")
-            for group, cons in self.consultations.items():
-                print(f"   - {group}: {len(cons)} консультаций")
-                for c in cons[:5]:
-                    print(f"      • {c['date']} {c['time']} - {c['subject'][:50] if c['subject'] else c['teacher']}")
+            print(f"\n✅ Загружено консультаций для {len(self.consultations)} Gruppen")
             
         except Exception as e:
             print(f"❌ Ошибка загрузки консультаций: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    def parse_consultation_cell(self, cell_text, default_date=None, default_time=None):
-        """Парсит ячейку с консультацией"""
-        if not cell_text:
-            return None
-        
-        consultation = {
-            'date': default_date or "",
-            'time': default_time or "",
-            'subject': "",
-            'teacher': "",
-            'room': ""
-        }
-        
-        # Убираем название группы из начала
-        text = re.sub(r'^[З3][А-Я]{2,3}-\d{2,3}\s*', '', cell_text)
-        
-        # Ищем слово "Консультация"
-        if 'Консультация' in text or 'консультация' in text.lower():
-            # Разделяем по слову "Консультация"
-            parts = re.split(r'Консультация', text, flags=re.IGNORECASE)
-            if len(parts) >= 2:
-                subject_part = parts[0].strip()
-                teacher_room_part = parts[1].strip() if len(parts) > 1 else ""
-                
-                consultation['subject'] = subject_part
-                
-                # Ищем преподавателя (Фамилия И.О.)
-                teacher_match = re.search(r'([А-Я][а-я]+)\s+([А-Я]\.[А-Я]\.?)', teacher_room_part)
-                if teacher_match:
-                    consultation['teacher'] = f"{teacher_match.group(1)} {teacher_match.group(2)}"
-                    teacher_room_part = teacher_room_part.replace(teacher_match.group(0), '').strip()
-                
-                # Ищем аудиторию
-                room_match = re.search(r'[А-Я]-\d{3}|[А-Я]-\d{2,3}|\b\d{3}\b', teacher_room_part)
-                if room_match:
-                    consultation['room'] = room_match.group()
-        else:
-            consultation['subject'] = text
-            
-            # Ищем преподавателя
-            teacher_match = re.search(r'([А-Я][а-я]+)\s+([А-Я]\.[А-Я]\.?)', text)
-            if teacher_match:
-                consultation['teacher'] = f"{teacher_match.group(1)} {teacher_match.group(2)}"
-            
-            # Ищем аудиторию
-            room_match = re.search(r'[А-Я]-\d{3}|[А-Я]-\d{2,3}|\b\d{3}\b', text)
-            if room_match:
-                consultation['room'] = room_match.group()
-        
-        # Очищаем от лишних символов
-        consultation['subject'] = re.sub(r'\s+', ' ', consultation['subject']).strip()
-        consultation['teacher'] = re.sub(r'\s+', ' ', consultation['teacher']).strip()
-        consultation['room'] = consultation['room'].strip() if consultation['room'] else ""
-        
-        return consultation
-    
-    async def load_exam_sessions(self):
-        """Загрузка расписания экзаменов для заочников"""
-        try:
-            corr_url, _ = await self.find_correspondence_links()
-            if not corr_url:
-                corr_url = FALLBACK_CORRESPONDENCE_URL
-                print(f"⚠️ Использую запасную ссылку для экзаменов: {corr_url}")
-            
-            file_content = await self.download_excel(corr_url)
-            if not file_content:
-                print("Не удалось скачать файл экзаменов")
-                return
-            
-            xl = pd.ExcelFile(io.BytesIO(file_content))
-            df = pd.read_excel(xl, sheet_name=0, dtype=str)
-            
-            exams_by_group = {}
-            
-            headers = df.iloc[0].astype(str).tolist()
-            
-            group_col = None
-            date_col = None
-            time_col = None
-            subject_col = None
-            teacher_col = None
-            room_col = None
-            
-            for i, header in enumerate(headers):
-                header_lower = str(header).lower()
-                if 'групп' in header_lower:
-                    group_col = i
-                elif 'дат' in header_lower:
-                    date_col = i
-                elif 'врем' in header_lower or 'час' in header_lower:
-                    time_col = i
-                elif 'предмет' in header_lower or 'дисциплин' in header_lower:
-                    subject_col = i
-                elif 'преподавател' in header_lower:
-                    teacher_col = i
-                elif 'аудитор' in header_lower or 'кабинет' in header_lower:
-                    room_col = i
-            
-            if group_col is None:
-                group_col = 0
-            if date_col is None:
-                date_col = 1
-            if time_col is None:
-                time_col = 2
-            if subject_col is None:
-                subject_col = 3
-            if teacher_col is None:
-                teacher_col = 4
-            if room_col is None:
-                room_col = 5
-            
-            for _, row in df.iloc[1:].iterrows():
-                group = str(row.iloc[group_col]).strip().upper() if pd.notna(row.iloc[group_col]) else ""
-                if not group or group == 'nan':
-                    continue
-                
-                exam = {
-                    'date': str(row.iloc[date_col]).strip() if pd.notna(row.iloc[date_col]) else "",
-                    'time': str(row.iloc[time_col]).strip() if pd.notna(row.iloc[time_col]) else "",
-                    'subject': str(row.iloc[subject_col]).strip() if pd.notna(row.iloc[subject_col]) else "",
-                    'teacher': str(row.iloc[teacher_col]).strip() if pd.notna(row.iloc[teacher_col]) else "",
-                    'room': str(row.iloc[room_col]).strip() if pd.notna(row.iloc[room_col]) else ""
-                }
-                
-                for key in exam:
-                    if exam[key] == 'nan':
-                        exam[key] = ""
-                
-                if exam['subject']:
-                    if group not in exams_by_group:
-                        exams_by_group[group] = []
-                    exams_by_group[group].append(exam)
-            
-            self.exam_sessions = exams_by_group
-            print(f"✅ Загружено экзаменов для {len(self.exam_sessions)} групп")
-            
-        except Exception as e:
-            print(f"❌ Ошибка загрузки экзаменов: {e}")
     
     async def load_all_data(self):
         results = []
@@ -900,7 +690,6 @@ class ScheduleMaster:
         correspondence_result = await self.load_correspondence_data()
         results.append(correspondence_result)
         await self.load_consultations()
-        await self.load_exam_sessions()
         self.last_update = datetime.now()
         return results
     
@@ -1000,79 +789,6 @@ class ScheduleMaster:
         
         return self.format_schedule(lessons, display_name, day_name, week_display, week_offset)
     
-    def get_day_schedule_correspondence(self, group_name, day_name=None):
-        if group_name not in self.correspondence_lessons:
-            return None
-        
-        lessons_data = self.correspondence_lessons[group_name]
-        if not lessons_data:
-            return None
-        
-        week_display, _, _ = get_week_type()
-        
-        lessons = []
-        seen_lessons = set()
-        
-        for lesson_num, lesson_data in lessons_data.items():
-            if day_name and lesson_data.get('day_name') != day_name:
-                continue
-            
-            lesson_key = f"{lesson_num}_{lesson_data['subject']}_{lesson_data['teacher']}"
-            if lesson_key not in seen_lessons:
-                seen_lessons.add(lesson_key)
-                lessons.append({
-                    'num': lesson_num,
-                    'data': lesson_data
-                })
-        
-        if not lessons:
-            return None
-        
-        lessons.sort(key=lambda x: x['num'])
-        
-        if day_name:
-            return self.format_schedule(lessons, group_name, day_name, week_display, show_date=True)
-        else:
-            return self.format_correspondence_schedule(lessons, group_name, week_display)
-    
-    def format_correspondence_schedule(self, lessons, group_name, week_display):
-        result = []
-        result.append("📚 <b>РАСПИСАНИЕ УСТАНОВОЧНОЙ СЕССИИ</b>")
-        result.append(f"👥 Группа: {group_name}")
-        result.append(week_display)
-        result.append("—" * 40)
-        
-        current_date = ""
-        for lesson in lessons:
-            data = lesson['data']
-            time = LESSON_TIMES.get(lesson['num'], "")
-            date_str = data.get('date', '')
-            day_name = data.get('day_name', '')
-            
-            if date_str != current_date:
-                current_date = date_str
-                result.append(f"\n📅 <b>{date_str} ({day_name})</b>")
-            
-            result.append(f"\n<b>{lesson['num']} пара</b> {time}")
-            
-            if data['subject']:
-                result.append(f"📖 {data['subject']}")
-            if data['teacher']:
-                result.append(f"👤 {data['teacher']}")
-            if data['room']:
-                if re.match(r'^\d{3}$', data['room']):
-                    result.append(f"🏫 ауд. {data['room']}")
-                else:
-                    result.append(f"🏫 {data['room']}")
-            if data['type']:
-                result.append(f"📌 {data['type']}")
-            if data.get('group'):
-                result.append(f"👥 {data['group']}")
-            
-            result.append("—" * 30)
-        
-        return "\n".join(result)
-    
     def format_schedule(self, lessons, group_name, day_name, week_display, week_offset=0, show_date=False):
         date_str = get_date_for_day(day_name, week_offset) if not show_date else ""
         
@@ -1108,172 +824,28 @@ class ScheduleMaster:
         return "\n".join(result)
     
     def get_consultations_for_group(self, group_name):
-        """Получение всех консультаций для группы (без дубликатов)"""
-        search_name = group_name.upper().replace(' ', '').replace('-', '')
-        
-        print(f"🔍 Поиск всех консультаций: группа={search_name}")
-        print(f"📋 Доступные группы: {list(self.consultations.keys())}")
-        
-        for group_key, cons in self.consultations.items():
-            group_key_clean = group_key.upper().replace(' ', '').replace('-', '')
-            if search_name == group_key_clean or search_name in group_key_clean or group_key_clean in search_name:
-                print(f"✅ Найдена группа {group_key}")
-                if not cons:
-                    return None
-                
-                # Удаляем дубликаты по комбинации дата+время+предмет
-                unique_cons = {}
-                for c in cons:
-                    key = f"{c.get('date', '')}_{c.get('time', '')}_{c.get('subject', '')}"
-                    if key not in unique_cons:
-                        unique_cons[key] = c
-                
-                sorted_cons = sorted(unique_cons.values(), key=lambda x: (x.get('date', ''), x.get('time', '')))
-                
-                result = []
-                result.append("📚 <b>ВСЕ КОНСУЛЬТАЦИИ</b>")
-                result.append(f"👥 Группа: {group_key}")
-                result.append("—" * 40)
-                
-                current_date = ""
-                for c in sorted_cons:
-                    if c.get('date') and c['date'] != current_date:
-                        current_date = c['date']
-                        try:
-                            date_obj = datetime.strptime(current_date, "%d.%m.%Y")
-                            day_name = RUSSIAN_DAYS[date_obj.weekday()]
-                            result.append(f"\n📅 <b>{current_date} ({day_name})</b>")
-                        except:
-                            result.append(f"\n📅 <b>{current_date}</b>")
-                    
-                    cons_line = ""
-                    if c.get('time'):
-                        cons_line += f"⏰ {c['time']}  "
-                    if c.get('subject'):
-                        cons_line += f"📖 {c['subject']}  "
-                    if c.get('teacher'):
-                        cons_line += f"👤 {c['teacher']}  "
-                    if c.get('room'):
-                        cons_line += f"🏫 {c['room']}"
-                    
-                    if cons_line.strip():
-                        result.append(cons_line)
-                    result.append("—" * 30)
-                
-                return "\n".join(result)
-        
-        print(f"❌ Группа {search_name} не найдена")
-        return None
-    
-    def get_consultations_for_date(self, group_name, target_date=None):
-        """Получение консультаций для группы на конкретную дату (без дубликатов)"""
-        if target_date is None:
-            target_date = datetime.now().strftime("%d.%m.%Y")
-        
-        target_date_normalized = target_date.replace('/', '.')
-        search_name = group_name.upper().replace(' ', '').replace('-', '')
-        
-        print(f"🔍 Поиск консультаций: группа={search_name}, дата={target_date_normalized}")
-        print(f"📋 Доступные группы: {list(self.consultations.keys())}")
-        
-        for group_key, cons in self.consultations.items():
-            group_key_clean = group_key.upper().replace(' ', '').replace('-', '')
-            if search_name == group_key_clean or search_name in group_key_clean or group_key_clean in search_name:
-                print(f"   ✅ Группа найдена: {group_key}")
-                if not cons:
-                    print(f"   ⚠️ Нет консультаций для группы")
-                    return None
-                
-                # Удаляем дубликаты по комбинации дата+время+предмет
-                unique_cons = {}
-                for c in cons:
-                    key = f"{c.get('date', '')}_{c.get('time', '')}_{c.get('subject', '')}"
-                    if key not in unique_cons:
-                        unique_cons[key] = c
-                
-                # Фильтруем по дате
-                filtered_cons = []
-                for c in unique_cons.values():
-                    cons_date = c.get('date', '')
-                    cons_date_normalized = cons_date.replace('/', '.')
-                    if cons_date_normalized == target_date_normalized:
-                        filtered_cons.append(c)
-                        print(f"      ✅ Совпадает!")
-                
-                if not filtered_cons:
-                    print(f"   ⚠️ Нет консультаций на дату {target_date_normalized}")
-                    return None
-                
-                sorted_cons = sorted(filtered_cons, key=lambda x: x.get('time', ''))
-                
-                try:
-                    date_obj = datetime.strptime(target_date_normalized, "%d.%m.%Y")
-                    day_name = RUSSIAN_DAYS[date_obj.weekday()]
-                except:
-                    day_name = ""
-                
-                result = []
-                result.append("📚 <b>КОНСУЛЬТАЦИИ НА СЕГОДНЯ</b>")
-                result.append(f"👥 Группа: {group_key}")
-                result.append(f"📅 {target_date_normalized} ({day_name})")
-                result.append("—" * 40)
-                
-                for c in sorted_cons:
-                    cons_line = ""
-                    if c.get('time'):
-                        cons_line += f"⏰ {c['time']}  "
-                    if c.get('subject'):
-                        cons_line += f"📖 {c['subject']}  "
-                    if c.get('teacher'):
-                        cons_line += f"👤 {c['teacher']}  "
-                    if c.get('room'):
-                        cons_line += f"🏫 {c['room']}"
-                    
-                    if cons_line.strip():
-                        result.append(cons_line)
-                    result.append("—" * 30)
-                
-                return "\n".join(result)
-        
-        print(f"❌ Группа {search_name} не найдена в консультациях")
-        return None
-    
-    def get_today_consultations(self, group_name):
-        """Получение консультаций на сегодня"""
-        today = datetime.now().strftime("%d.%m.%Y")
-        print(f"🔍 get_today_consultations: {group_name}, today={today}")
-        result = self.get_consultations_for_date(group_name, today)
-        if result:
-            print(f"✅ Найдены консультации для {group_name}")
-        else:
-            print(f"❌ Консультации для {group_name} не найдены")
-        return result
-    
-    def get_exams_for_group(self, group_name):
-        if group_name not in self.exam_sessions:
+        if group_name not in self.consultations:
             return None
         
-        exams = self.exam_sessions[group_name]
-        if not exams:
+        cons = self.consultations[group_name]
+        if not cons:
             return None
         
         result = []
-        result.append("📚 <b>РАСПИСАНИЕ ЭКЗАМЕНОВ (СЕССИЯ)</b>")
+        result.append("📚 <b>КОНСУЛЬТАЦИИ</b>")
         result.append(f"👥 Группа: {group_name}")
         result.append("—" * 40)
         
-        sorted_exams = sorted(exams, key=lambda x: x.get('date', ''))
-        
-        for exam in sorted_exams:
-            result.append(f"\n📅 {exam.get('date', 'дата не указана')}")
-            if exam.get('time'):
-                result.append(f"⏰ {exam['time']}")
-            if exam.get('subject'):
-                result.append(f"📖 {exam['subject']}")
-            if exam.get('teacher'):
-                result.append(f"👤 {exam['teacher']}")
-            if exam.get('room'):
-                result.append(f"🏫 {exam['room']}")
+        for c in cons:
+            result.append(f"\n📅 {c.get('date', 'дата не указана')}")
+            if c.get('time'):
+                result.append(f"⏰ {c['time']}")
+            if c.get('subject'):
+                result.append(f"📖 {c['subject']}")
+            if c.get('teacher'):
+                result.append(f"👤 {c['teacher']}")
+            if c.get('room'):
+                result.append(f"🏫 {c['room']}")
             result.append("—" * 30)
         
         return "\n".join(result)
@@ -1368,7 +940,59 @@ class ScheduleMaster:
                 
                 result_lines.append("—" * 30)
         
-        return "\n".join(result_lines)
+        return "\n".join(result)
+    
+    def format_student_teacher_search(self, results, teacher_name, day_name, week_offset=0):
+        if not results:
+            return None
+        
+        week_display, _, _ = get_week_type(week_offset)
+        date_str = get_date_for_day(day_name, week_offset)
+        
+        result_lines = []
+        result_lines.append(f"👨‍🏫 <b>ПРЕПОДАВАТЕЛЬ: {teacher_name}</b>")
+        result_lines.append(f"📅 {day_name} {date_str}")
+        result_lines.append(week_display)
+        result_lines.append("=" * 40)
+        
+        lessons_by_num = {}
+        for r in results:
+            num = r['num']
+            if num not in lessons_by_num:
+                lessons_by_num[num] = []
+            lessons_by_num[num].append(r)
+        
+        for lesson_num in sorted(lessons_by_num.keys()):
+            time = LESSON_TIMES.get(lesson_num, "")
+            result_lines.append(f"\n<b>⏰ {lesson_num} пара</b> ({time})")
+            
+            seen_in_lesson = set()
+            for r in lessons_by_num[lesson_num]:
+                data = r['data']
+                
+                lesson_key = f"{data['subject']}_{data.get('group', '')}_{data['room']}"
+                if lesson_key in seen_in_lesson:
+                    continue
+                seen_in_lesson.add(lesson_key)
+                
+                if data['subject']:
+                    result_lines.append(f"📖 <b>{data['subject']}</b>")
+                
+                group = data.get('group', '')
+                if not group:
+                    group = self.extract_group_from_cell(data['full_text'])
+                if group:
+                    result_lines.append(f"👥 <b>Группа:</b> {group}")
+                
+                if data['room']:
+                    result_lines.append(f"🏫 <b>Аудитория:</b> {data['room']}")
+                
+                if data['type']:
+                    result_lines.append(f"📌 <b>Тип:</b> {data['type']}")
+                
+                result_lines.append("─" * 30)
+        
+        return "\n".join(result)
 
 # --- КЛАВИАТУРЫ ---
 def get_user_type_keyboard():
@@ -1380,12 +1004,21 @@ def get_user_type_keyboard():
     )
     return keyboard
 
+def get_reset_keyboard():
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Да, начать заново"), KeyboardButton(text="❌ Нет, продолжить")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
+
 def get_main_keyboard_student():
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📅 Текущая неделя"), KeyboardButton(text="📅 Следующая неделя")],
-            [KeyboardButton(text="📋 Список групп"), KeyboardButton(text="🔄 Обновить")],
-            [KeyboardButton(text="🔄 Сменить пользователя")]
+            [KeyboardButton(text="🔍 Поиск преподавателя"), KeyboardButton(text="📋 Список групп")],
+            [KeyboardButton(text="🔄 Обновить"), KeyboardButton(text="🔄 Сменить пользователя")]
         ],
         resize_keyboard=True
     )
@@ -1408,6 +1041,28 @@ def get_main_keyboard_teacher():
             [KeyboardButton(text="📅 Текущая неделя"), KeyboardButton(text="📅 Следующая неделя")],
             [KeyboardButton(text="🔄 Обновить")],
             [KeyboardButton(text="🔄 Сменить пользователя")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
+
+def get_week_selection_keyboard():
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📅 Текущая неделя"), KeyboardButton(text="📅 Следующая неделя")],
+            [KeyboardButton(text="◀️ Назад")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
+
+def get_days_keyboard():
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Понедельник"), KeyboardButton(text="Вторник")],
+            [KeyboardButton(text="Среда"), KeyboardButton(text="Четверг")],
+            [KeyboardButton(text="Пятница"), KeyboardButton(text="Суббота")],
+            [KeyboardButton(text="◀️ Назад")]
         ],
         resize_keyboard=True
     )
@@ -1449,14 +1104,39 @@ def get_back_keyboard():
     )
     return keyboard
 
-# --- ОБРАБОТЧИКИ ---
-bot = Bot(token=BOT_TOKEN)
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+async def health_check(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f"🌐 Веб-сервер запущен на порту {PORT}")
+
+# --- ОСНОВНЫЕ ОБРАБОТЧИКИ ---
 dp = Dispatcher()
 schedule = ScheduleMaster()
+bot = None
 
 @dp.message(Command('start'))
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
+    
+    welcome_text = (
+        "🎓 <b>РГАТУ Расписание</b>\n\n"
+        "📚 <b>Что умеет этот бот?</b>\n"
+        "⭐ Вся информация о расписании получена с официального сайта РГАТУ имени П.А. Соловьева.\n\n"
+        "🔹 Просмотр расписания по группам (с учётом подгрупп)\n"
+        "🔹 Просмотр расписания по преподавателям\n"
+        "🔹 Просмотр расписания для заочников (консультации)\n"
+        "🔹 Автоматическое определение чётной/нечётной недели\n"
+        "🔹 Автоматическое обновление данных с сайта\n\n"
+        "👇 <b>Вы студент или преподаватель?</b>"
+    )
     
     if user_id in user_data:
         user_type = user_data[user_id].get('type')
@@ -1486,7 +1166,8 @@ async def cmd_start(message: Message, state: FSMContext):
         return
     
     await message.answer(
-        "👋 Добро пожаловать!\n\nВы студент или преподаватель?",
+        welcome_text,
+        parse_mode='HTML',
         reply_markup=get_user_type_keyboard()
     )
     await state.set_state(States.waiting_for_user_type)
@@ -1498,9 +1179,7 @@ async def process_user_type(message: Message, state: FSMContext):
     if message.text == "👨‍🎓 Студент":
         await state.update_data(user_type='student')
         await message.answer(
-            "Введите вашу группу:\n\n"
-            "Для очников: ИВБ-24, ИВБ-25, ВРБ-21\n"
-            "Для заочников: ЗВС-22, ЗВС-24 (начинается с буквы З)",
+            "Введите вашу группу:\n\nДля очников: ИВБ-24, ИВБ-25, ВРБ-21\nДля заочников: ЗВС-22, ЗВС-24 (начинается с буквы З)",
             reply_markup=get_back_keyboard()
         )
         await state.set_state(States.waiting_for_group)
@@ -1608,26 +1287,11 @@ async def process_group(message: Message, state: FSMContext):
             reply_markup=get_main_keyboard_student()
         )
     else:
-        # Заочник - показываем ТОЛЬКО консультации на сегодня при регистрации
-        today_cons = schedule.get_today_consultations(exact_group)
-        
-        if today_cons:
-            await message.answer(today_cons, parse_mode='HTML')
-        else:
-            await message.answer(f"📭 На сегодня консультаций для группы {exact_group} нет")
-        
-        # НЕ показываем все консультации автоматически при регистрации
-        # Они будут доступны по кнопке "📋 Все консультации"
-        
-        # Показываем расписание сессии (если есть)
-        result = schedule.get_day_schedule_correspondence(exact_group, None)
+        result = schedule.get_consultations_for_group(exact_group)
         if result:
             await message.answer(result, parse_mode='HTML')
-        
-        # Показываем экзамены (если есть)
-        exams_result = schedule.get_exams_for_group(exact_group)
-        if exams_result:
-            await message.answer(exams_result, parse_mode='HTML')
+        else:
+            await message.answer(f"📭 Для группы {exact_group} консультации не найдены")
         
         await message.answer(
             f"✅ Группа {exact_group} сохранена!\n{week_display}",
@@ -1695,19 +1359,17 @@ async def current_week_menu(message: Message, state: FSMContext):
     group_type = user_data[user_id].get('group_type', '')
     
     if group_type == 'correspondence':
-        await message.answer("❌ Для заочников расписание по дням недели не предусмотрено.\nИспользуйте кнопки '📋 Консультации сегодня', '📋 Все консультации' и '📋 Экзамены'")
+        await message.answer("❌ Для заочников расписание по дням недели не предусмотрено.\nИспользуйте кнопку '📋 Консультации'")
         return
     
     await state.update_data(week_offset=0)
     
     if user_type == 'student':
-        group_info = user_data[user_id]
-        if group_info.get('group_type') == "fulltime":
-            await message.answer(
-                "Выберите день (текущая неделя):",
-                reply_markup=get_day_selection_keyboard('student', 'current')
-            )
-            await state.set_state(States.waiting_for_day)
+        await message.answer(
+            "Выберите день (текущая неделя):",
+            reply_markup=get_day_selection_keyboard('student', 'current')
+        )
+        await state.set_state(States.waiting_for_day)
     else:
         await message.answer(
             "Выберите день (текущая неделя):",
@@ -1727,19 +1389,17 @@ async def next_week_menu(message: Message, state: FSMContext):
     group_type = user_data[user_id].get('group_type', '')
     
     if group_type == 'correspondence':
-        await message.answer("❌ Для заочников расписание по дням недели не предусмотрено.\nИспользуйте кнопки '📋 Консультации сегодня', '📋 Все консультации' и '📋 Экзамены'")
+        await message.answer("❌ Для заочников расписание по дням недели не предусмотрено.\nИспользуйте кнопку '📋 Консультации'")
         return
     
     await state.update_data(week_offset=1)
     
     if user_type == 'student':
-        group_info = user_data[user_id]
-        if group_info.get('group_type') == "fulltime":
-            await message.answer(
-                "Выберите день (следующая неделя):",
-                reply_markup=get_day_selection_keyboard('student', 'next')
-            )
-            await state.set_state(States.waiting_for_day)
+        await message.answer(
+            "Выберите день (следующая неделя):",
+            reply_markup=get_day_selection_keyboard('student', 'next')
+        )
+        await state.set_state(States.waiting_for_day)
     else:
         await message.answer(
             "Выберите день (следующая неделя):",
@@ -1747,102 +1407,11 @@ async def next_week_menu(message: Message, state: FSMContext):
         )
         await state.set_state(States.waiting_for_teacher_day)
 
-@dp.message(F.text == "📋 Консультации сегодня")
-async def show_today_consultations(message: Message):
-    user_id = message.from_user.id
-    
-    if user_id not in user_data:
-        await message.answer("❌ Сначала зарегистрируйтесь через /start")
-        return
-    
-    group_info = user_data[user_id]
-    if group_info.get('group_type') != 'correspondence':
-        await message.answer("❌ Консультации доступны только для заочников")
-        return
-    
-    group_name = group_info['group']
-    today = datetime.now().strftime("%d.%m.%Y")
-    today_name = get_today_name()
-    
-    result = schedule.get_consultations_for_date(group_name, today)
-    
-    if result:
-        await message.answer(result, parse_mode='HTML')
-    else:
-        await message.answer(f"📭 Для группы {group_name} на {today_name} ({today}) консультаций нет")
-
-@dp.message(F.text == "📋 Все консультации")
-async def show_all_consultations(message: Message):
-    user_id = message.from_user.id
-    
-    if user_id not in user_data:
-        await message.answer("❌ Сначала зарегистрируйтесь через /start")
-        return
-    
-    group_info = user_data[user_id]
-    if group_info.get('group_type') != 'correspondence':
-        await message.answer("❌ Консультации доступны только для заочников")
-        return
-    
-    group_name = group_info['group']
-    result = schedule.get_consultations_for_group(group_name)
-    
-    if result:
-        await message.answer(result, parse_mode='HTML')
-    else:
-        await message.answer(f"📭 Для группы {group_name} консультации не найдены")
-
-@dp.message(F.text == "📋 Экзамены")
-async def show_exams(message: Message):
-    user_id = message.from_user.id
-    
-    if user_id not in user_data:
-        await message.answer("❌ Сначала зарегистрируйтесь через /start")
-        return
-    
-    group_info = user_data[user_id]
-    if group_info.get('group_type') != 'correspondence':
-        await message.answer("❌ Экзамены доступны только для заочников")
-        return
-    
-    group_name = group_info['group']
-    result = schedule.get_exams_for_group(group_name)
-    
-    if result:
-        await message.answer(result, parse_mode='HTML')
-    else:
-        await message.answer(f"📭 Для группы {group_name} экзамены не найдены")
-
-@dp.message(F.text == "📅 Расписание сессии")
-async def show_session_schedule(message: Message):
-    user_id = message.from_user.id
-    
-    if user_id not in user_data:
-        await message.answer("❌ Сначала зарегистрируйтесь через /start")
-        return
-    
-    group_info = user_data[user_id]
-    if group_info.get('group_type') != 'correspondence':
-        await message.answer("❌ Расписание сессии доступно только для заочников")
-        return
-    
-    group_name = group_info['group']
-    result = schedule.get_day_schedule_correspondence(group_name, None)
-    
-    if result:
-        await message.answer(result, parse_mode='HTML')
-    else:
-        await message.answer(f"📭 Для группы {group_name} расписание сессии не найдено")
-
 @dp.message(States.waiting_for_day)
 async def show_group_schedule(message: Message, state: FSMContext):
     if message.text == "◀️ Назад":
         await state.clear()
-        user_type = user_data.get(message.from_user.id, {}).get('type', 'student')
-        if user_type == 'teacher':
-            await message.answer("Главное меню:", reply_markup=get_main_keyboard_teacher())
-        else:
-            await message.answer("Главное меню:", reply_markup=get_main_keyboard_student())
+        await message.answer("Главное меню:", reply_markup=get_main_keyboard_student())
         return
     
     user_id = message.from_user.id
@@ -1909,6 +1478,145 @@ async def show_teacher_schedule(message: Message, state: FSMContext):
         "Выберите другой день:",
         reply_markup=get_day_selection_keyboard('teacher', 'current' if week_offset == 0 else 'next')
     )
+
+@dp.message(F.text == "🔍 Поиск преподавателя")
+async def student_search_teacher(message: Message, state: FSMContext):
+    if message.from_user.id not in user_data:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
+        return
+    
+    group_type = user_data[message.from_user.id].get('group_type', '')
+    if group_type == 'correspondence':
+        await message.answer("❌ Для заочников поиск преподавателя не поддерживается.")
+        return
+    
+    await message.answer(
+        "👨‍🏫 Введите фамилию преподавателя (например: Иванов, Петрова, Комаров):",
+        reply_markup=get_back_keyboard()
+    )
+    await state.set_state(States.waiting_for_student_teacher_search)
+
+@dp.message(States.waiting_for_student_teacher_search)
+async def process_student_teacher_name(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.clear()
+        await message.answer("Главное меню:", reply_markup=get_main_keyboard_student())
+        return
+    
+    teacher_name = message.text.strip()
+    await state.update_data(search_teacher_name=teacher_name)
+    
+    await message.answer(
+        "📅 Выберите неделю для поиска:",
+        reply_markup=get_week_selection_keyboard()
+    )
+    await state.set_state(States.waiting_for_student_teacher_week)
+
+@dp.message(States.waiting_for_student_teacher_week)
+async def process_student_teacher_week(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await state.update_data(search_teacher_name=None)
+        await message.answer(
+            "👨‍🏫 Введите фамилию преподавателя:",
+            reply_markup=get_back_keyboard()
+        )
+        await state.set_state(States.waiting_for_student_teacher_search)
+        return
+    
+    if message.text == "📅 Текущая неделя":
+        week_offset = 0
+    elif message.text == "📅 Следующая неделя":
+        week_offset = 1
+    else:
+        await message.answer("Пожалуйста, выберите неделю из меню")
+        return
+    
+    await state.update_data(search_week_offset=week_offset)
+    
+    await message.answer(
+        "📅 Выберите день для поиска:",
+        reply_markup=get_days_keyboard()
+    )
+    await state.set_state(States.waiting_for_student_teacher_day)
+
+@dp.message(States.waiting_for_student_teacher_day)
+async def process_student_teacher_day(message: Message, state: FSMContext):
+    if message.text == "◀️ Назад":
+        await message.answer(
+            "📅 Выберите неделю для поиска:",
+            reply_markup=get_week_selection_keyboard()
+        )
+        await state.set_state(States.waiting_for_student_teacher_week)
+        return
+    
+    day_name = message.text
+    if day_name not in DAYS:
+        await message.answer("Пожалуйста, выберите день из меню")
+        return
+    
+    data = await state.get_data()
+    teacher_name = data.get('search_teacher_name')
+    week_offset = data.get('search_week_offset', 0)
+    
+    msg = await message.answer(f"🔍 Ищу преподавателя {teacher_name} на {day_name}...")
+    
+    results = schedule.search_teacher(teacher_name, day_name, week_offset)
+    await msg.delete()
+    
+    if results:
+        formatted = schedule.format_student_teacher_search(results, teacher_name, day_name, week_offset)
+        await message.answer(formatted, parse_mode='HTML')
+    else:
+        week_text = "следующей" if week_offset == 1 else "текущей"
+        await message.answer(f"❌ Преподаватель {teacher_name} не найден на {day_name} {week_text} неделе")
+    
+    await message.answer(
+        "Главное меню:",
+        reply_markup=get_main_keyboard_student()
+    )
+    await state.clear()
+
+@dp.message(F.text == "📋 Консультации сегодня")
+async def show_today_consultations(message: Message):
+    user_id = message.from_user.id
+    
+    if user_id not in user_data:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
+        return
+    
+    group_info = user_data[user_id]
+    if group_info.get('group_type') != 'correspondence':
+        await message.answer("❌ Консультации доступны только для заочников")
+        return
+    
+    group_name = group_info['group']
+    result = schedule.get_consultations_for_group(group_name)
+    
+    if result:
+        await message.answer(result, parse_mode='HTML')
+    else:
+        await message.answer(f"📭 Для группы {group_name} консультации не найдены")
+
+@dp.message(F.text == "📋 Все консультации")
+async def show_all_consultations(message: Message):
+    user_id = message.from_user.id
+    
+    if user_id not in user_data:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
+        return
+    
+    group_info = user_data[user_id]
+    if group_info.get('group_type') != 'correspondence':
+        await message.answer("❌ Консультации доступны только для заочников")
+        return
+    
+    group_name = group_info['group']
+    result = schedule.get_consultations_for_group(group_name)
+    
+    if result:
+        await message.answer(result, parse_mode='HTML')
+    else:
+        await message.answer(f"📭 Для группы {group_name} консультации не найдены")
 
 @dp.message(F.text == "📋 Список групп")
 async def show_groups(message: Message):
@@ -2000,7 +1708,22 @@ async def back_to_menu(message: Message, state: FSMContext):
 # --- ЗАПУСК ---
 async def main():
     print("🤖 Запуск бота...")
+    
+    global bot
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    
+    await start_web()
     await schedule.start()
+    
+    try:
+        me = await bot.get_me()
+        print(f"✅ Бот @{me.username} успешно подключён к Telegram API")
+    except Exception as e:
+        print(f"❌ Ошибка подключения: {e}")
+        print("💡 Возможные решения: отключите антивирус, включите VPN")
+        return
+    
+    print("📂 Загрузка данных с сайта РГАТУ...")
     results = await schedule.load_all_data()
     for success, result in results:
         print(result)
@@ -2010,6 +1733,7 @@ async def main():
     print(f"📅 Сегодня: {today}")
     print(f"📅 Текущая неделя: {week_display}")
     print(f"✅ Бот готов!")
+    
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
