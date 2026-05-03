@@ -220,33 +220,34 @@ class ScheduleMaster:
     
     async def start(self):
         timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=10)
-        self.session = aiohttp.ClientSession(timeout=timeout)
+        connector = aiohttp.TCPConnector(limit=10)
+        self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
     
     async def stop(self):
         if self.session:
             await self.session.close()
     
     async def ensure_data_loaded(self):
-        """Загружает данные, если они старые или отсутствуют"""
+        """Быстрая проверка — возвращает мгновенно, если данные есть"""
         if self.last_update is None:
             print("📂 Первичная загрузка данных...")
             await self.load_all_data()
-        elif datetime.now() - self.last_update > timedelta(hours=1):
-            print("🔄 Данные устарели, обновляем...")
-            await self.load_all_data()
         else:
-            print("✅ Данные актуальны, кэш используется")
+            print("✅ Данные из кэша (мгновенно)")
     
     async def fetch_page(self, url):
-        try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            async with self.session.get(url, timeout=30, ssl=False, headers=headers) as response:
-                return await response.text() if response.status == 200 else None
-        except Exception as e:
-            print(f"Ошибка загрузки {url}: {e}")
-            return None
+        for attempt in range(3):
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                async with self.session.get(url, timeout=15, ssl=False, headers=headers) as response:
+                    if response.status == 200:
+                        return await response.text()
+            except Exception as e:
+                print(f"Попытка {attempt+1}/3: {e}")
+                await asyncio.sleep(1)
+        return None
     
     async def find_excel_links(self, url):
         html = await self.fetch_page(url)
@@ -270,19 +271,18 @@ class ScheduleMaster:
         return excel_links[0]
     
     async def download_excel(self, url):
-        try:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            async with self.session.get(url, timeout=60, ssl=False, headers=headers) as response:
-                if response.status == 200:
-                    return await response.read()
-                else:
-                    print(f"Ошибка скачивания: статус {response.status}")
-                    return None
-        except Exception as e:
-            print(f"Ошибка скачивания: {e}")
-            return None
+        for attempt in range(3):
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                async with self.session.get(url, timeout=30, ssl=False, headers=headers) as response:
+                    if response.status == 200:
+                        return await response.read()
+            except Exception as e:
+                print(f"Попытка скачивания {attempt+1}/3: {e}")
+                await asyncio.sleep(2)
+        return None
     
     async def find_correspondence_links(self):
         html = await self.fetch_page(SCHEDULE_PAGE)
@@ -709,6 +709,7 @@ class ScheduleMaster:
         results.append(correspondence_result)
         await self.load_consultations()
         self.last_update = datetime.now()
+        print("✅ Все данные успешно загружены")
         return results
     
     def find_group(self, group_name):
@@ -1134,6 +1135,15 @@ async def start_web():
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     print(f"🌐 Веб-сервер запущен на порту {PORT}")
+
+# --- ФОНОВОЕ ОБНОВЛЕНИЕ ДАННЫХ ---
+async def background_updater():
+    """Фоновое обновление данных каждые 60 минут"""
+    while True:
+        await asyncio.sleep(3600)  # 1 час
+        print("🔄 Фоновое обновление данных...")
+        await schedule.load_all_data()
+        print("✅ Данные обновлены в фоне")
 
 # --- ОСНОВНЫЕ ОБРАБОТЧИКИ ---
 dp = Dispatcher()
@@ -1743,13 +1753,17 @@ async def main():
     await schedule.start()
     await schedule.ensure_data_loaded()
     
+    # Запускаем фоновое обновление данных
+    asyncio.create_task(background_updater())
+    
     try:
         me = await bot.get_me()
         print(f"✅ Бот @{me.username} успешно подключён к Telegram API")
     except Exception as e:
         print(f"❌ Ошибка подключения: {e}")
         print("💡 Возможные решения: отключите антивирус, включите VPN")
-        return    
+        return
+    
     today = get_today_name()
     week_display, _, _ = get_week_type()
     print(f"📅 Сегодня: {today}")
