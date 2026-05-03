@@ -1326,6 +1326,24 @@ async def main():
     print(f"📅 Текущая неделя: {week_display}")
     print(f"✅ Бот готов!")
     await dp.start_polling(bot)
+from aiohttp import web
 
+PORT = int(os.environ.get('PORT', 10000))
+
+async def health_check(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f"🌐 Веб-сервер запущен на порту {PORT}")
+
+async def main():
+    await start_web()  # Добавить эту строку
+    # ... остальной код
 if __name__ == '__main__':
     asyncio.run(main())
