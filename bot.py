@@ -219,16 +219,30 @@ class ScheduleMaster:
         self.last_update = None
     
     async def start(self):
-        timeout = aiohttp.ClientTimeout(total=60, connect=30, sock_read=30)
+        timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=10)
         self.session = aiohttp.ClientSession(timeout=timeout)
     
     async def stop(self):
         if self.session:
             await self.session.close()
     
+    async def ensure_data_loaded(self):
+        """Загружает данные, если они старые или отсутствуют"""
+        if self.last_update is None:
+            print("📂 Первичная загрузка данных...")
+            await self.load_all_data()
+        elif datetime.now() - self.last_update > timedelta(hours=1):
+            print("🔄 Данные устарели, обновляем...")
+            await self.load_all_data()
+        else:
+            print("✅ Данные актуальны, кэш используется")
+    
     async def fetch_page(self, url):
         try:
-            async with self.session.get(url, timeout=30, ssl=False) as response:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            async with self.session.get(url, timeout=30, ssl=False, headers=headers) as response:
                 return await response.text() if response.status == 200 else None
         except Exception as e:
             print(f"Ошибка загрузки {url}: {e}")
@@ -257,10 +271,14 @@ class ScheduleMaster:
     
     async def download_excel(self, url):
         try:
-            async with self.session.get(url, timeout=60, ssl=False) as response:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            async with self.session.get(url, timeout=60, ssl=False, headers=headers) as response:
                 if response.status == 200:
                     return await response.read()
                 else:
+                    print(f"Ошибка скачивания: статус {response.status}")
                     return None
         except Exception as e:
             print(f"Ошибка скачивания: {e}")
@@ -596,7 +614,7 @@ class ScheduleMaster:
             
             print(f"\n✅ Заочники: загружено {len(self.correspondence_groups)} групп")
             
-            return True, f"✅ Заочники: {len(self.correspondence_groups)} Gruppen"
+            return True, f"✅ Заочники: {len(self.correspondence_groups)} групп"
             
         except Exception as e:
             print(f"❌ Ошибка загрузки заочников: {str(e)}")
@@ -678,7 +696,7 @@ class ScheduleMaster:
                         print(f"   ✅ Добавлена консультация для {group_name}")
             
             self.consultations = consultations_by_group
-            print(f"\n✅ Загружено консультаций для {len(self.consultations)} Gruppen")
+            print(f"\n✅ Загружено консультаций для {len(self.consultations)} групп")
             
         except Exception as e:
             print(f"❌ Ошибка загрузки консультаций: {e}")
@@ -1126,6 +1144,9 @@ bot = None
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
     
+    # Проверяем загрузку данных
+    await schedule.ensure_data_loaded()
+    
     welcome_text = (
         "🎓 <b>РГАТУ Расписание</b>\n\n"
         "📚 <b>Что умеет этот бот?</b>\n"
@@ -1241,6 +1262,8 @@ async def process_group(message: Message, state: FSMContext):
     
     msg = await message.answer("🔍 Ищу группу...")
     
+    await schedule.ensure_data_loaded()
+    
     exact_group, group_type = schedule.find_group(group_name)
     
     if not exact_group:
@@ -1334,6 +1357,7 @@ async def process_subgroup(message: Message, state: FSMContext):
     week_display, _, _ = get_week_type()
     
     today = get_today_name()
+    await schedule.ensure_data_loaded()
     result = schedule.get_day_schedule_fulltime(base_group, subgroup, today)
     
     if result:
@@ -1426,6 +1450,7 @@ async def show_group_schedule(message: Message, state: FSMContext):
     
     msg = await message.answer(f"🔍 Загружаю расписание на {day_name}...")
     
+    await schedule.ensure_data_loaded()
     subgroup = group_info.get('subgroup')
     result = schedule.get_day_schedule_fulltime(group_info['group'], subgroup, day_name, week_offset)
     await msg.delete()
@@ -1464,6 +1489,7 @@ async def show_teacher_schedule(message: Message, state: FSMContext):
     
     msg = await message.answer(f"🔍 Загружаю расписание для преподавателя {teacher_name}...")
     
+    await schedule.ensure_data_loaded()
     results = schedule.search_teacher(teacher_name, day_name, week_offset)
     await msg.delete()
     
@@ -1560,6 +1586,7 @@ async def process_student_teacher_day(message: Message, state: FSMContext):
     
     msg = await message.answer(f"🔍 Ищу преподавателя {teacher_name} на {day_name}...")
     
+    await schedule.ensure_data_loaded()
     results = schedule.search_teacher(teacher_name, day_name, week_offset)
     await msg.delete()
     
@@ -1590,6 +1617,7 @@ async def show_today_consultations(message: Message):
         return
     
     group_name = group_info['group']
+    await schedule.ensure_data_loaded()
     result = schedule.get_consultations_for_group(group_name)
     
     if result:
@@ -1611,6 +1639,7 @@ async def show_all_consultations(message: Message):
         return
     
     group_name = group_info['group']
+    await schedule.ensure_data_loaded()
     result = schedule.get_consultations_for_group(group_name)
     
     if result:
@@ -1620,6 +1649,8 @@ async def show_all_consultations(message: Message):
 
 @dp.message(F.text == "📋 Список групп")
 async def show_groups(message: Message):
+    await schedule.ensure_data_loaded()
+    
     all_groups = []
     
     for group in schedule.fulltime_base_groups:
@@ -1660,23 +1691,19 @@ async def show_groups(message: Message):
 @dp.message(F.text == "🔄 Обновить")
 async def update_data(message: Message):
     msg = await message.answer("🔄 Обновляю данные...")
-    results = await schedule.load_all_data()
+    await schedule.ensure_data_loaded()
     await msg.delete()
     
     text = "📊 <b>РЕЗУЛЬТАТ</b>\n\n"
-    for success, result in results:
-        text += f"{result}\n"
+    text += f"✅ Данные обновлены: {schedule.last_update.strftime('%d.%m.%Y %H:%M:%S') if schedule.last_update else 'только что'}"
     
     user_type = user_data.get(message.from_user.id, {}).get('type', 'student')
     group_type = user_data.get(message.from_user.id, {}).get('group_type', '')
     
-    if user_type == 'teacher':
+    if user_type == 'teacher' or group_type == 'correspondence':
         await message.answer(text, parse_mode='HTML', reply_markup=get_main_keyboard_teacher())
     else:
-        if group_type == 'correspondence':
-            await message.answer(text, parse_mode='HTML', reply_markup=get_main_keyboard_correspondence())
-        else:
-            await message.answer(text, parse_mode='HTML', reply_markup=get_main_keyboard_student())
+        await message.answer(text, parse_mode='HTML', reply_markup=get_main_keyboard_student())
 
 @dp.message(F.text == "🔄 Сменить пользователя")
 async def change_user(message: Message, state: FSMContext):
@@ -1714,6 +1741,7 @@ async def main():
     
     await start_web()
     await schedule.start()
+    await schedule.ensure_data_loaded()
     
     try:
         me = await bot.get_me()
@@ -1721,13 +1749,7 @@ async def main():
     except Exception as e:
         print(f"❌ Ошибка подключения: {e}")
         print("💡 Возможные решения: отключите антивирус, включите VPN")
-        return
-    
-    print("📂 Загрузка данных с сайта РГАТУ...")
-    results = await schedule.load_all_data()
-    for success, result in results:
-        print(result)
-    
+        return    
     today = get_today_name()
     week_display, _, _ = get_week_type()
     print(f"📅 Сегодня: {today}")
