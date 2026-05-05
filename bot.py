@@ -12,7 +12,6 @@ from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.client.bot import DefaultBotProperties
 
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -226,17 +225,23 @@ class ScheduleMaster:
         if self.last_update is None:
             print("📂 Первичная загрузка данных...")
             await self.load_all_data()
+        elif datetime.now() - self.last_update > timedelta(hours=1):
+            print("🔄 Данные устарели, обновляем...")
+            await self.load_all_data()
         else:
-            print("✅ Данные из кэша")
+            print("✅ Данные актуальны, кэш используется")
     
     async def fetch_page(self, url):
         for attempt in range(3):
             try:
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
                 async with self.session.get(url, timeout=15, ssl=False, headers=headers) as response:
                     if response.status == 200:
                         return await response.text()
-            except:
+            except Exception as e:
+                print(f"Попытка {attempt+1}/3: {e}")
                 await asyncio.sleep(1)
         return None
     
@@ -244,6 +249,7 @@ class ScheduleMaster:
         html = await self.fetch_page(url)
         if not html:
             return []
+        
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, 'html.parser')
         excel_links = []
@@ -256,16 +262,21 @@ class ScheduleMaster:
     
     async def get_latest_excel(self, page_url):
         excel_links = await self.find_excel_links(page_url)
-        return excel_links[0] if excel_links else None
+        if not excel_links:
+            return None
+        return excel_links[0]
     
     async def download_excel(self, url):
         for attempt in range(3):
             try:
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
                 async with self.session.get(url, timeout=30, ssl=False, headers=headers) as response:
                     if response.status == 200:
                         return await response.read()
-            except:
+            except Exception as e:
+                print(f"Попытка скачивания {attempt+1}/3: {e}")
                 await asyncio.sleep(2)
         return None
     
@@ -273,19 +284,27 @@ class ScheduleMaster:
         html = await self.fetch_page(SCHEDULE_PAGE)
         if not html:
             return None, None
+        
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, 'html.parser')
+        
         correspondence_url = None
         consultations_url = None
+        
         for link in soup.find_all('a', href=True):
             href = link['href']
             text = link.get_text().lower()
+            
             if ('заочн' in text or 'заочное' in text) and ('.xlsx' in href or '.xls' in href):
                 full_url = href if href.startswith('http') else f"{UNIVERSITY_URL}{href}"
                 correspondence_url = full_url
+                print(f"✅ Найдено расписание заочников: {full_url}")
+            
             if ('консультац' in text or 'конс' in text) and ('.xlsx' in href or '.xls' in href):
                 full_url = href if href.startswith('http') else f"{UNIVERSITY_URL}{href}"
                 consultations_url = full_url
+                print(f"✅ Найдены консультации: {full_url}")
+        
         return correspondence_url, consultations_url
     
     def clean_value(self, value):
@@ -320,6 +339,7 @@ class ScheduleMaster:
     
     def split_lessons_in_cell(self, cell_text):
         lines = cell_text.split('\n')
+        
         if len(lines) > 1:
             lessons = []
             for line in lines:
@@ -339,10 +359,13 @@ class ScheduleMaster:
                         if next_m.start() > match.start():
                             next_match = next_m
                             break
+                    
                     if next_match:
                         lesson_text = cell_text[start_pos:next_match.start()].strip()
+                    
                     if lesson_text and lesson_text not in lessons:
                         lessons.append(lesson_text)
+                
                 if not lessons:
                     return [cell_text]
                 return lessons
@@ -351,17 +374,20 @@ class ScheduleMaster:
     
     def parse_lesson(self, cell_text):
         text = self.remove_all_groups(cell_text)
+        
         lesson_type = ""
         type_match = TYPE_PATTERN.search(cell_text)
         if type_match:
             type_code = type_match.group(1)
             lesson_type = LESSON_TYPES.get(type_code, "")
             text = re.sub(r'\b' + re.escape(type_code) + r'\b', '', text)
+        
         room = ""
         room_match = ROOM_PATTERN.search(text)
         if room_match:
             room = room_match.group()
             text = text.replace(room, "")
+        
         teacher = ""
         teacher_match = TEACHER_PATTERN.search(text)
         if teacher_match:
@@ -374,8 +400,10 @@ class ScheduleMaster:
             if simple_match and len(simple_match.group(1)) > 2:
                 teacher = simple_match.group(1)
                 text = text.replace(teacher, "")
+        
         group = self.extract_group_from_cell(cell_text)
         subject = re.sub(r'\s+', ' ', text).strip()
+        
         return {
             'subject': subject,
             'teacher': teacher,
@@ -396,9 +424,11 @@ class ScheduleMaster:
             current_url = await self.get_latest_excel(SCHEDULE_PAGE)
             if not current_url:
                 return False, "Не найдена ссылка для очников"
+            
             file_content = await self.download_excel(current_url)
             if not file_content:
                 return False, "Не удалось скачать файл"
+            
             xl = pd.ExcelFile(io.BytesIO(file_content))
             groups_found = set()
             base_groups_found = set()
@@ -407,11 +437,17 @@ class ScheduleMaster:
             dfs_cache = {}
             teacher_lessons = []
             room_lessons = []
+            
             sheet_name = "Расписание (группы)"
             if sheet_name not in xl.sheet_names:
                 sheet_name = xl.sheet_names[0]
+                print(f"⚠️ Лист 'Расписание (группы)' не найден, используем: {sheet_name}")
+            
             df = pd.read_excel(xl, sheet_name=sheet_name, header=None, dtype=str)
             dfs_cache[sheet_name] = df
+            
+            print(f"\n🔍 ПОИСК ЗАГОЛОВКОВ ГРУПП")
+            
             for col_idx in range(len(df.columns)):
                 cell = df.iat[0, col_idx]
                 if pd.notna(cell):
@@ -422,19 +458,25 @@ class ScheduleMaster:
                             full_name = cell_str
                             groups_found.add(full_name)
                             base_groups_found.add(base_group)
+                            
                             if full_name not in group_positions:
                                 group_positions[full_name] = []
                             group_positions[full_name].append((sheet_name, 0, col_idx))
+                            
                             if subgroup:
                                 if base_group not in subgroups_found:
                                     subgroups_found[base_group] = set()
                                 subgroups_found[base_group].add(subgroup)
+                            
+                            print(f"✅ Найдена группа: {full_name}")
+            
             for week_start, week_end in [(2, 43), (44, 85)]:
                 for col_idx in range(len(df.columns)):
                     for row_idx in range(week_start - 1, min(week_end, len(df))):
                         cell_val = str(df.iat[row_idx, col_idx]).strip() if pd.notna(df.iat[row_idx, col_idx]) else ""
                         if cell_val and cell_val not in ["", "nan", "—"]:
                             lessons_in_cell = self.split_lessons_in_cell(cell_val)
+                            
                             for lesson_text in lessons_in_cell:
                                 teacher_match = TEACHER_PATTERN.search(lesson_text)
                                 if teacher_match:
@@ -453,6 +495,7 @@ class ScheduleMaster:
                                             'col': col_idx,
                                             'teacher': simple_match.group(1)
                                         })
+                                
                                 room_match = ROOM_PATTERN.search(lesson_text)
                                 if room_match:
                                     room_lessons.append({
@@ -461,6 +504,7 @@ class ScheduleMaster:
                                         'col': col_idx,
                                         'room': room_match.group()
                                     })
+            
             self.fulltime_groups = sorted(list(groups_found))
             self.fulltime_base_groups = sorted(list(base_groups_found))
             self.fulltime_subgroups = {k: sorted(list(v)) for k, v in subgroups_found.items()}
@@ -468,8 +512,14 @@ class ScheduleMaster:
             self.fulltime_dfs = dfs_cache
             self.teacher_lessons = teacher_lessons
             self.room_lessons = room_lessons
+            
+            print(f"\n✅ Загружено {len(self.fulltime_base_groups)} базовых групп")
+            print(f"👥 Найдено записей о преподавателях: {len(self.teacher_lessons)}")
+            
             return True, f"✅ Очники: {len(self.fulltime_base_groups)} групп"
+            
         except Exception as e:
+            print(f"❌ Ошибка загрузки: {str(e)}")
             return False, f"❌ Ошибка: {str(e)}"
     
     async def load_correspondence_data(self):
@@ -477,17 +527,25 @@ class ScheduleMaster:
             corr_url, _ = await self.find_correspondence_links()
             if not corr_url:
                 corr_url = FALLBACK_CORRESPONDENCE_URL
+                print(f"⚠️ Использую запасную ссылку: {corr_url}")
+            
             file_content = await self.download_excel(corr_url)
             if not file_content:
                 return False, "Не удалось скачать файл заочников"
+            
             xl = pd.ExcelFile(io.BytesIO(file_content))
             groups_found = set()
             group_positions = {}
             dfs_cache = {}
             lessons_by_group = {}
+            
             sheet_name = xl.sheet_names[0]
             df = pd.read_excel(xl, sheet_name=sheet_name, header=None, dtype=str)
             dfs_cache[sheet_name] = df
+            
+            print(f"\n🔍 ПОИСК ЗАГОЛОВКОВ ГРУПП ЗАОЧНИКОВ")
+            print(f"📊 Размер файла: {len(df)} строк, {len(df.columns)} столбцов")
+            
             group_columns = {}
             for col_idx in range(len(df.columns)):
                 cell = df.iat[0, col_idx]
@@ -498,23 +556,50 @@ class ScheduleMaster:
                         groups_found.add(group_name)
                         group_columns[group_name] = col_idx
                         group_positions[group_name] = (sheet_name, 0, col_idx)
+                        print(f"✅ Найдена группа: {group_name}")
+            
+            if not groups_found:
+                print("⚠️ Не найдено групп в первой строке, ищем по всему файлу...")
+                for row_idx in range(min(5, len(df))):
+                    for col_idx in range(len(df.columns)):
+                        cell = df.iat[row_idx, col_idx]
+                        if pd.notna(cell):
+                            cell_str = str(cell).strip()
+                            if re.search(r'[З3][А-Я]{2,4}-\d{2,3}', cell_str) or re.search(r'[З3][А-Я]{2,3}-\d{2,3}', cell_str):
+                                group_name = cell_str.strip()
+                                if group_name not in groups_found:
+                                    groups_found.add(group_name)
+                                    group_columns[group_name] = col_idx
+                                    group_positions[group_name] = (sheet_name, row_idx, col_idx)
+                                    print(f"✅ Найдена группа в строке {row_idx}: {group_name}")
+            
+            print(f"\n📋 Найдено групп заочников: {len(groups_found)}")
+            for g in groups_found:
+                print(f"   - {g}")
+            
             for group_name, col_idx in group_columns.items():
                 lessons_by_group[group_name] = {}
+                
                 for row_idx in range(1, len(df)):
                     date_val = str(df.iat[row_idx, 0]).strip() if pd.notna(df.iat[row_idx, 0]) else ""
                     lesson_info = str(df.iat[row_idx, 1]).strip() if pd.notna(df.iat[row_idx, 1]) else ""
+                    
                     lesson_num = 0
                     match = re.search(r'(\d+)\s*пара', lesson_info)
                     if match:
                         lesson_num = int(match.group(1))
+                    
                     if lesson_num == 0:
                         continue
+                    
                     day_name = ""
                     for day in ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]:
                         if day in lesson_info:
                             day_name = day
                             break
+                    
                     cell_val = str(df.iat[row_idx, col_idx]).strip() if pd.notna(df.iat[row_idx, col_idx]) else ""
+                    
                     if cell_val and cell_val not in ["", "nan", "—"]:
                         lessons_in_cell = self.split_lessons_in_cell(cell_val)
                         for lesson_text in lessons_in_cell:
@@ -522,12 +607,18 @@ class ScheduleMaster:
                             lesson_data['date'] = date_val
                             lesson_data['day_name'] = day_name
                             lessons_by_group[group_name][lesson_num] = lesson_data
+            
             self.correspondence_groups = sorted(list(groups_found))
             self.correspondence_positions = group_positions
             self.correspondence_dfs = dfs_cache
             self.correspondence_lessons = lessons_by_group
+            
+            print(f"\n✅ Заочники: загружено {len(self.correspondence_groups)} групп")
+            
             return True, f"✅ Заочники: {len(self.correspondence_groups)} групп"
+            
         except Exception as e:
+            print(f"❌ Ошибка загрузки заочников: {str(e)}")
             return False, f"❌ Ошибка: {str(e)}"
     
     async def load_consultations(self):
@@ -535,21 +626,29 @@ class ScheduleMaster:
             _, cons_url = await self.find_correspondence_links()
             if not cons_url:
                 cons_url = FALLBACK_CONSULTATIONS_URL
+                print(f"⚠️ Использую запасную ссылку: {cons_url}")
+            
             file_content = await self.download_excel(cons_url)
             if not file_content:
                 print("Не удалось скачать файл консультаций")
                 return
+            
             xl = pd.ExcelFile(io.BytesIO(file_content))
             df = pd.read_excel(xl, sheet_name=0, header=None, dtype=str)
+            
             consultations_by_group = {}
+            
             group_pattern = re.compile(r'([З3][А-Я]{2,3}-\d{2,3})', re.IGNORECASE)
             date_pattern = re.compile(r'(\d{4}-\d{2}-\d{2})')
             time_pattern = re.compile(r'(\d{1,2}:\d{2})')
+            
             current_date = None
             processed_times = set()
+            
             for row_idx in range(len(df)):
                 first_cell = str(df.iat[row_idx, 0]) if pd.notna(df.iat[row_idx, 0]) else ""
                 second_cell = str(df.iat[row_idx, 1]) if pd.notna(df.iat[row_idx, 1]) else ""
+                
                 date_match = date_pattern.search(first_cell)
                 if date_match:
                     current_date = date_match.group(1)
@@ -558,24 +657,32 @@ class ScheduleMaster:
                         current_date = f"{date_parts[2]}.{date_parts[1]}.{date_parts[0]}"
                     processed_times.clear()
                     continue
+                
                 if not current_date:
                     continue
+                
                 current_time = None
                 if second_cell and second_cell != 'nan' and ':' in second_cell:
                     current_time = second_cell.strip()
+                
                 if not current_time:
                     continue
+                
                 time_key = f"{current_date}_{current_time}"
                 if time_key in processed_times:
                     continue
                 processed_times.add(time_key)
+                
                 for col_idx in range(2, len(df.columns)):
                     cell_value = str(df.iat[row_idx, col_idx]) if pd.notna(df.iat[row_idx, col_idx]) else ""
+                    
                     if not cell_value or cell_value == 'nan' or cell_value == 'None':
                         continue
+                    
                     group_match = group_pattern.search(cell_value)
                     if group_match:
                         group_name = group_match.group(1).upper()
+                        
                         consultation = {
                             'date': current_date,
                             'time': current_time,
@@ -583,12 +690,17 @@ class ScheduleMaster:
                             'teacher': "",
                             'room': ""
                         }
+                        
                         if group_name not in consultations_by_group:
                             consultations_by_group[group_name] = []
                         consultations_by_group[group_name].append(consultation)
+                        print(f"   ✅ Добавлена консультация для {group_name}")
+            
             self.consultations = consultations_by_group
+            print(f"\n✅ Загружено консультаций для {len(self.consultations)} групп")
+            
         except Exception as e:
-            print(f"Ошибка загрузки консультаций: {e}")
+            print(f"❌ Ошибка загрузки консультаций: {e}")
     
     async def load_all_data(self):
         results = []
@@ -598,11 +710,12 @@ class ScheduleMaster:
         results.append(correspondence_result)
         await self.load_consultations()
         self.last_update = datetime.now()
-        print("✅ Все данные загружены")
+        print("✅ Все данные успешно загружены")
         return results
     
     def find_group(self, group_name):
         group_upper = self.normalize_group_name(group_name)
+        
         if self.is_correspondence_group(group_upper):
             for corr_group in self.correspondence_groups:
                 if group_upper in corr_group or corr_group in group_upper:
@@ -610,11 +723,14 @@ class ScheduleMaster:
                 if group_upper.replace('-', '') == corr_group.replace('-', ''):
                     return corr_group, "correspondence"
             return group_upper, "correspondence"
+        
         if group_upper in self.fulltime_base_groups:
             return group_upper, "fulltime"
+        
         for base_group in self.fulltime_base_groups:
             if group_upper in base_group or base_group in group_upper:
                 return base_group, "fulltime"
+        
         return None, None
     
     def get_subgroups(self, base_group):
@@ -628,66 +744,87 @@ class ScheduleMaster:
                     for pos in self.fulltime_positions[variant]:
                         sheet, row, col = pos
                         return col, sheet
+        
         if base_group in self.fulltime_positions:
             for pos in self.fulltime_positions[base_group]:
                 sheet, row, col = pos
                 return col, sheet
+        
         return None, None
     
     def get_day_schedule_fulltime(self, base_group, subgroup, day_name, week_offset=0):
         week_display, week_start, week_end = get_week_type(week_offset)
+        
         col, sheet = self.get_fulltime_column(base_group, subgroup)
         if col is None:
             return None
+        
         day_start_excel = get_day_start_row(week_start, day_name)
         day_start_index = day_start_excel - 1
+        
         df = self.fulltime_dfs[sheet]
+        
         if subgroup:
             display_name = f"{base_group}-{subgroup}"
         else:
             display_name = base_group
+        
         lessons = []
         seen_lessons = set()
+        
         for i in range(7):
             row_index = day_start_index + i
             if row_index >= len(df):
                 continue
+            
             row_excel = row_index + 1
             if row_excel > week_end:
                 continue
+            
             cell_val = str(df.iat[row_index, col]).strip() if pd.notna(df.iat[row_index, col]) else ""
+            
             if cell_val and cell_val not in ["", "nan", "—"]:
                 lesson_num = i + 1
                 lessons_in_cell = self.split_lessons_in_cell(cell_val)
+                
                 for lesson_text in lessons_in_cell:
                     lesson_data = self.parse_lesson(lesson_text)
+                    
                     if subgroup:
                         lesson_group = lesson_data.get('group', '')
                         if lesson_group and str(subgroup) not in lesson_group:
                             continue
+                    
                     lesson_key = f"{lesson_num}_{lesson_data['subject']}_{lesson_data['teacher']}"
+                    
                     if lesson_key not in seen_lessons:
                         seen_lessons.add(lesson_key)
                         lessons.append({
                             'num': lesson_num,
                             'data': lesson_data
                         })
+        
         if not lessons:
             return None
+        
         return self.format_schedule(lessons, display_name, day_name, week_display, week_offset)
     
     def format_schedule(self, lessons, group_name, day_name, week_display, week_offset=0, show_date=False):
         date_str = get_date_for_day(day_name, week_offset) if not show_date else ""
+        
         result = []
         result.append("📚 <b>РАСПИСАНИЕ</b>")
         result.append(f"👥 Группа: {group_name}")
         result.append(f"📅 {day_name} {date_str}")
         result.append(week_display)
         result.append("—" * 40)
+        
         for lesson in lessons:
             data = lesson['data']
             time = LESSON_TIMES.get(lesson['num'], "")
+            
             result.append(f"\n<b>{lesson['num']} пара</b> {time}")
+            
             if data['subject']:
                 result.append(f"📖 {data['subject']}")
             if data['teacher']:
@@ -701,19 +838,24 @@ class ScheduleMaster:
                 result.append(f"📌 {data['type']}")
             if data.get('group'):
                 result.append(f"👥 {data['group']}")
+            
             result.append("—" * 30)
+        
         return "\n".join(result)
     
     def get_consultations_for_group(self, group_name):
         if group_name not in self.consultations:
             return None
+        
         cons = self.consultations[group_name]
         if not cons:
             return None
+        
         result = []
         result.append("📚 <b>КОНСУЛЬТАЦИИ</b>")
         result.append(f"👥 Группа: {group_name}")
         result.append("—" * 40)
+        
         for c in cons:
             result.append(f"\n📅 {c.get('date', 'дата не указана')}")
             if c.get('time'):
@@ -725,11 +867,13 @@ class ScheduleMaster:
             if c.get('room'):
                 result.append(f"🏫 {c['room']}")
             result.append("—" * 30)
+        
         return "\n".join(result)
     
     def search_teacher(self, teacher_name, day_name=None, week_offset=0):
         results = []
         week_display, week_start, week_end = get_week_type(week_offset)
+        
         if day_name:
             day_start = get_day_start_row(week_start, day_name)
             row_start = day_start - 1
@@ -737,22 +881,28 @@ class ScheduleMaster:
         else:
             row_start = week_start - 1
             row_end = week_end - 1
+        
         search_name = teacher_name.strip().upper()
         search_name = re.sub(r'\s+[А-Я]\.[А-Я]\.?', '', search_name).strip()
+        
         lessons_by_num = {}
+        
         for lesson in self.teacher_lessons:
             if row_start <= lesson['row'] - 1 <= row_end:
                 teacher_last_name = lesson['teacher'].upper()
+                
                 if teacher_last_name == search_name:
                     lesson_num = (lesson['row'] - row_start - 1) % 7 + 1
                     lesson_data = self.parse_lesson(lesson['cell'])
                     lesson_key = f"{lesson_num}_{lesson_data['subject']}_{lesson_data['teacher']}_{lesson_data.get('group', '')}"
+                    
                     if lesson_key not in lessons_by_num:
                         lessons_by_num[lesson_key] = {
                             'data': lesson_data,
                             'num': lesson_num,
                             'row': lesson['row']
                         }
+        
         results = list(lessons_by_num.values())
         results.sort(key=lambda x: (x['num'], x['row']))
         return results
@@ -760,148 +910,221 @@ class ScheduleMaster:
     def format_teacher_schedule(self, results, teacher_name, day_name, week_offset=0):
         if not results:
             return None
+        
         week_display, _, _ = get_week_type(week_offset)
         date_str = get_date_for_day(day_name, week_offset)
+        
         result_lines = []
         result_lines.append(f"👤 <b>ПРЕПОДАВАТЕЛЬ: {teacher_name}</b>")
         result_lines.append(f"📅 {day_name} {date_str}")
         result_lines.append(week_display)
         result_lines.append("—" * 40)
+        
         lessons_by_num = {}
         for r in results:
             num = r['num']
             if num not in lessons_by_num:
                 lessons_by_num[num] = []
             lessons_by_num[num].append(r)
+        
         for lesson_num in sorted(lessons_by_num.keys()):
             time = LESSON_TIMES.get(lesson_num, "")
             result_lines.append(f"\n<b>{lesson_num} пара</b> {time}")
+            
             seen_in_lesson = set()
             for r in lessons_by_num[lesson_num]:
                 data = r['data']
+                
                 lesson_key = f"{data['subject']}_{data['teacher']}_{data.get('group', '')}"
                 if lesson_key in seen_in_lesson:
                     continue
                 seen_in_lesson.add(lesson_key)
+                
                 if data['subject']:
                     result_lines.append(f"📖 {data['subject']}")
+                
                 group = data.get('group', '')
                 if not group:
                     group = self.extract_group_from_cell(data['full_text'])
                 if group:
                     result_lines.append(f"👥 {group}")
+                
                 if data['room']:
                     if re.match(r'^\d{3}$', data['room']):
                         result_lines.append(f"🏫 ауд. {data['room']}")
                     else:
                         result_lines.append(f"🏫 {data['room']}")
+                
                 if data['type']:
                     result_lines.append(f"📌 {data['type']}")
+                
                 result_lines.append("—" * 30)
+        
         return "\n".join(result)
     
     def format_student_teacher_search(self, results, teacher_name, day_name, week_offset=0):
         if not results:
             return None
+        
         week_display, _, _ = get_week_type(week_offset)
         date_str = get_date_for_day(day_name, week_offset)
+        
         result_lines = []
         result_lines.append(f"👨‍🏫 <b>ПРЕПОДАВАТЕЛЬ: {teacher_name}</b>")
         result_lines.append(f"📅 {day_name} {date_str}")
         result_lines.append(week_display)
         result_lines.append("=" * 40)
+        
         lessons_by_num = {}
         for r in results:
             num = r['num']
             if num not in lessons_by_num:
                 lessons_by_num[num] = []
             lessons_by_num[num].append(r)
+        
         for lesson_num in sorted(lessons_by_num.keys()):
             time = LESSON_TIMES.get(lesson_num, "")
             result_lines.append(f"\n<b>⏰ {lesson_num} пара</b> ({time})")
+            
             seen_in_lesson = set()
             for r in lessons_by_num[lesson_num]:
                 data = r['data']
+                
                 lesson_key = f"{data['subject']}_{data.get('group', '')}_{data['room']}"
                 if lesson_key in seen_in_lesson:
                     continue
                 seen_in_lesson.add(lesson_key)
+                
                 if data['subject']:
                     result_lines.append(f"📖 <b>{data['subject']}</b>")
+                
                 group = data.get('group', '')
                 if not group:
                     group = self.extract_group_from_cell(data['full_text'])
                 if group:
                     result_lines.append(f"👥 <b>Группа:</b> {group}")
+                
                 if data['room']:
                     result_lines.append(f"🏫 <b>Аудитория:</b> {data['room']}")
+                
                 if data['type']:
                     result_lines.append(f"📌 <b>Тип:</b> {data['type']}")
+                
                 result_lines.append("─" * 30)
+        
         return "\n".join(result)
 
 # --- КЛАВИАТУРЫ ---
 def get_user_type_keyboard():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="👨‍🎓 Студент"), KeyboardButton(text="👨‍🏫 Преподаватель")]], resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👨‍🎓 Студент"), KeyboardButton(text="👨‍🏫 Преподаватель")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
+
+def get_reset_keyboard():
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Да, начать заново"), KeyboardButton(text="❌ Нет, продолжить")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
 
 def get_main_keyboard_student():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📅 Текущая неделя"), KeyboardButton(text="📅 Следующая неделя")],
-        [KeyboardButton(text="🔍 Поиск преподавателя"), KeyboardButton(text="📋 Список групп")],
-        [KeyboardButton(text="🔄 Обновить"), KeyboardButton(text="🔄 Сменить пользователя")]
-    ], resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📅 Текущая неделя"), KeyboardButton(text="📅 Следующая неделя")],
+            [KeyboardButton(text="🔍 Поиск преподавателя"), KeyboardButton(text="📋 Список групп")],
+            [KeyboardButton(text="🔄 Обновить"), KeyboardButton(text="🔄 Сменить пользователя")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
 
 def get_main_keyboard_correspondence():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📋 Консультации сегодня"), KeyboardButton(text="📋 Все консультации")],
-        [KeyboardButton(text="🔄 Обновить"), KeyboardButton(text="🔄 Сменить пользователя")]
-    ], resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Консультации сегодня"), KeyboardButton(text="📋 Все консультации")],
+            [KeyboardButton(text="📅 Расписание сессии"), KeyboardButton(text="📋 Экзамены")],
+            [KeyboardButton(text="🔄 Обновить"), KeyboardButton(text="🔄 Сменить пользователя")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
 
 def get_main_keyboard_teacher():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📅 Текущая неделя"), KeyboardButton(text="📅 Следующая неделя")],
-        [KeyboardButton(text="🔄 Обновить"), KeyboardButton(text="🔄 Сменить пользователя")]
-    ], resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📅 Текущая неделя"), KeyboardButton(text="📅 Следующая неделя")],
+            [KeyboardButton(text="🔄 Обновить")],
+            [KeyboardButton(text="🔄 Сменить пользователя")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
 
 def get_week_selection_keyboard():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📅 Текущая неделя"), KeyboardButton(text="📅 Следующая неделя")],
-        [KeyboardButton(text="◀️ Назад")]
-    ], resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📅 Текущая неделя"), KeyboardButton(text="📅 Следующая неделя")],
+            [KeyboardButton(text="◀️ Назад")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
 
 def get_days_keyboard():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Понедельник"), KeyboardButton(text="Вторник")],
-        [KeyboardButton(text="Среда"), KeyboardButton(text="Четверг")],
-        [KeyboardButton(text="Пятница"), KeyboardButton(text="Суббота")],
-        [KeyboardButton(text="◀️ Назад")]
-    ], resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Понедельник"), KeyboardButton(text="Вторник")],
+            [KeyboardButton(text="Среда"), KeyboardButton(text="Четверг")],
+            [KeyboardButton(text="Пятница"), KeyboardButton(text="Суббота")],
+            [KeyboardButton(text="◀️ Назад")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
 
 def get_day_selection_keyboard(user_type, week_type):
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Понедельник"), KeyboardButton(text="Вторник")],
-        [KeyboardButton(text="Среда"), KeyboardButton(text="Четверг")],
-        [KeyboardButton(text="Пятница"), KeyboardButton(text="Суббота")],
-        [KeyboardButton(text="◀️ Назад")]
-    ], resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Понедельник"), KeyboardButton(text="Вторник")],
+            [KeyboardButton(text="Среда"), KeyboardButton(text="Четверг")],
+            [KeyboardButton(text="Пятница"), KeyboardButton(text="Суббота")],
+            [KeyboardButton(text="◀️ Назад")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
 
 def get_subgroups_keyboard(subgroups):
     keyboard = []
     row = []
+    
     for sg in subgroups:
         row.append(KeyboardButton(text=f"Подгруппа {sg}"))
         if len(row) == 3:
             keyboard.append(row)
             row = []
+    
     if row:
         keyboard.append(row)
+    
     keyboard.append([KeyboardButton(text="◀️ Назад")])
+    
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 def get_back_keyboard():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="◀️ Назад")]], resize_keyboard=True)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="◀️ Назад")]],
+        resize_keyboard=True
+    )
+    return keyboard
 
-# --- ОБРАБОТЧИКИ ---
+# --- ОСНОВНЫЕ ОБРАБОТЧИКИ ---
 dp = Dispatcher()
 schedule = ScheduleMaster()
 bot = None
@@ -909,7 +1132,7 @@ bot = None
 @dp.message(Command('start'))
 async def cmd_start(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    await schedule.ensure_data_loaded()
+    
     welcome_text = (
         "🎓 <b>РГАТУ Расписание</b>\n\n"
         "📚 <b>Что умеет этот бот?</b>\n"
@@ -921,35 +1144,61 @@ async def cmd_start(message: Message, state: FSMContext):
         "🔹 Автоматическое обновление данных с сайта\n\n"
         "👇 <b>Вы студент или преподаватель?</b>"
     )
+    
     if user_id in user_data:
         user_type = user_data[user_id].get('type')
         group_type = user_data[user_id].get('group_type', '')
+        
         if user_type == 'student':
             if group_type == 'correspondence':
                 week_display, _, _ = get_week_type()
-                await message.answer(f"👋 С возвращением! Ваша группа: {user_data[user_id].get('display_name', '')}\n{week_display}", reply_markup=get_main_keyboard_correspondence())
+                await message.answer(
+                    f"👋 С возвращением! Ваша группа: {user_data[user_id].get('display_name', '')}\n{week_display}",
+                    reply_markup=get_main_keyboard_correspondence()
+                )
             else:
                 display = user_data[user_id].get('display_name', user_data[user_id].get('group', ''))
                 week_display, _, _ = get_week_type()
-                await message.answer(f"👋 С возвращением! Ваша группа: {display}\n{week_display}", reply_markup=get_main_keyboard_student())
+                await message.answer(
+                    f"👋 С возвращением! Ваша группа: {display}\n{week_display}",
+                    reply_markup=get_main_keyboard_student()
+                )
         else:
             teacher_name = user_data[user_id].get('teacher_name', '')
             week_display, _, _ = get_week_type()
-            await message.answer(f"👋 С возвращением! Вы зарегистрированы как преподаватель: {teacher_name}\n{week_display}", reply_markup=get_main_keyboard_teacher())
+            await message.answer(
+                f"👋 С возвращением! Вы зарегистрированы как преподаватель: {teacher_name}\n{week_display}",
+                reply_markup=get_main_keyboard_teacher()
+            )
         return
-    await message.answer(welcome_text, parse_mode='HTML', reply_markup=get_user_type_keyboard())
+    
+    await message.answer(
+        welcome_text,
+        parse_mode='HTML',
+        reply_markup=get_user_type_keyboard()
+    )
     await state.set_state(States.waiting_for_user_type)
 
 @dp.message(States.waiting_for_user_type)
 async def process_user_type(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    
     if message.text == "👨‍🎓 Студент":
         await state.update_data(user_type='student')
-        await message.answer("Введите вашу группу:\n\nДля очников: ИВБ-24, ИВБ-25, ВРБ-21\nДля заочников: ЗВС-22, ЗВС-24 (начинается с буквы З)", reply_markup=get_back_keyboard())
+        await message.answer(
+            "Введите вашу группу:\n\nДля очников: ИВБ-24, ИВБ-25, ВРБ-21\nДля заочников: ЗВС-22, ЗВС-24 (начинается с буквы З)",
+            reply_markup=get_back_keyboard()
+        )
         await state.set_state(States.waiting_for_group)
+    
     elif message.text == "👨‍🏫 Преподаватель":
         await state.update_data(user_type='teacher')
-        await message.answer("Введите вашу фамилию (например: Иванов, Петрова):", reply_markup=get_back_keyboard())
+        await message.answer(
+            "Введите вашу фамилию (например: Иванов, Петрова):",
+            reply_markup=get_back_keyboard()
+        )
         await state.set_state(States.waiting_for_teacher_name)
+    
     else:
         await message.answer("Пожалуйста, выберите 'Студент' или 'Преподаватель'")
 
@@ -959,18 +1208,32 @@ async def process_teacher_name(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Главное меню:", reply_markup=get_main_keyboard_student())
         return
+    
     teacher_name = message.text.strip()
     user_id = message.from_user.id
+    
     parts = teacher_name.split()
+    
     if len(parts) >= 1:
         last_name = parts[0].capitalize()
         if len(parts) >= 2:
             teacher_name = f"{last_name} {parts[1]}"
         else:
             teacher_name = last_name
-    user_data[user_id] = {'type': 'teacher', 'teacher_name': teacher_name, 'display_name': teacher_name}
+    
+    user_data[user_id] = {
+        'type': 'teacher',
+        'teacher_name': teacher_name,
+        'display_name': teacher_name
+    }
+    
     week_display, _, _ = get_week_type()
-    await message.answer(f"✅ Вы зарегистрированы как преподаватель: {teacher_name}\n{week_display}\n\nТеперь вы можете смотреть своё расписание.", reply_markup=get_main_keyboard_teacher())
+    
+    await message.answer(
+        f"✅ Вы зарегистрированы как преподаватель: {teacher_name}\n{week_display}\n\n"
+        f"Теперь вы можете смотреть своё расписание.",
+        reply_markup=get_main_keyboard_teacher()
+    )
     await state.clear()
 
 @dp.message(States.waiting_for_group)
@@ -979,40 +1242,71 @@ async def process_group(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Главное меню:", reply_markup=get_main_keyboard_student())
         return
+    
     user_id = message.from_user.id
     group_name = message.text.strip().upper()
+    
     msg = await message.answer("🔍 Ищу группу...")
+    
     await schedule.ensure_data_loaded()
+    
     exact_group, group_type = schedule.find_group(group_name)
+    
     if not exact_group:
         await msg.delete()
-        await message.answer(f"❌ Группа '{group_name}' не найдена.\n\nНажмите '📋 Список групп' чтобы увидеть все группы.", reply_markup=get_main_keyboard_student())
+        await message.answer(
+            f"❌ Группа '{group_name}' не найдена.\n\n"
+            f"Нажмите '📋 Список групп' чтобы увидеть все группы.",
+            reply_markup=get_main_keyboard_student()
+        )
         await state.clear()
         return
-    user_data[user_id] = {'type': 'student', 'group': exact_group, 'group_type': group_type, 'display_name': exact_group}
+    
+    user_data[user_id] = {
+        'type': 'student',
+        'group': exact_group,
+        'group_type': group_type,
+        'display_name': exact_group
+    }
+    
     week_display, _, _ = get_week_type()
     await msg.delete()
+    
     if group_type == "fulltime":
         subgroups = schedule.get_subgroups(exact_group)
         if subgroups:
             await state.update_data(base_group=exact_group, group_type=group_type)
-            await message.answer(f"✅ Найдена группа {exact_group}\n\nУ этой группы есть подгруппы. Выберите свою:", reply_markup=get_subgroups_keyboard(subgroups))
+            await message.answer(
+                f"✅ Найдена группа {exact_group}\n\n"
+                f"У этой группы есть подгруппы. Выберите свою:",
+                reply_markup=get_subgroups_keyboard(subgroups)
+            )
             await state.set_state(States.waiting_for_subgroup)
             return
+        
         today = get_today_name()
         result = schedule.get_day_schedule_fulltime(exact_group, None, today)
         if result:
             await message.answer(result, parse_mode='HTML')
         else:
             await message.answer(f"📭 На сегодня ({today}) занятий нет")
-        await message.answer(f"✅ Группа {exact_group} сохранена!\n{week_display}", reply_markup=get_main_keyboard_student())
+        
+        await message.answer(
+            f"✅ Группа {exact_group} сохранена!\n{week_display}",
+            reply_markup=get_main_keyboard_student()
+        )
     else:
         result = schedule.get_consultations_for_group(exact_group)
         if result:
             await message.answer(result, parse_mode='HTML')
         else:
             await message.answer(f"📭 Для группы {exact_group} консультации не найдены")
-        await message.answer(f"✅ Группа {exact_group} сохранена!\n{week_display}", reply_markup=get_main_keyboard_correspondence())
+        
+        await message.answer(
+            f"✅ Группа {exact_group} сохранена!\n{week_display}",
+            reply_markup=get_main_keyboard_correspondence()
+        )
+    
     await state.clear()
 
 @dp.message(States.waiting_for_subgroup)
@@ -1021,67 +1315,106 @@ async def process_subgroup(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Главное меню:", reply_markup=get_main_keyboard_student())
         return
+    
     user_id = message.from_user.id
     data = await state.get_data()
     base_group = data['base_group']
     group_type = data['group_type']
-    if not message.text.startswith("Подгруппа "):
+    
+    if message.text.startswith("Подгруппа "):
+        try:
+            subgroup = int(message.text.replace("Подгруппа ", ""))
+        except:
+            await message.answer("Пожалуйста, выберите подгруппу из меню")
+            return
+    else:
         await message.answer("Пожалуйста, выберите подгруппу из меню")
         return
-    try:
-        subgroup = int(message.text.replace("Подгруппа ", ""))
-    except:
-        await message.answer("Пожалуйста, выберите подгруппу из меню")
-        return
+    
     display_name = f"{base_group}-{subgroup}"
-    user_data[user_id] = {'type': 'student', 'group': base_group, 'subgroup': subgroup, 'group_type': group_type, 'display_name': display_name}
+    user_data[user_id] = {
+        'type': 'student',
+        'group': base_group,
+        'subgroup': subgroup,
+        'group_type': group_type,
+        'display_name': display_name
+    }
+    
     week_display, _, _ = get_week_type()
+    
     today = get_today_name()
     await schedule.ensure_data_loaded()
     result = schedule.get_day_schedule_fulltime(base_group, subgroup, today)
+    
     if result:
         await message.answer(result, parse_mode='HTML')
     else:
         await message.answer(f"📭 На сегодня ({today}) занятий нет")
-    await message.answer(f"✅ Группа {display_name} сохранена!\n{week_display}", reply_markup=get_main_keyboard_student())
+    
+    await message.answer(
+        f"✅ Группа {display_name} сохранена!\n{week_display}",
+        reply_markup=get_main_keyboard_student()
+    )
     await state.clear()
 
 @dp.message(F.text == "📅 Текущая неделя")
 async def current_week_menu(message: Message, state: FSMContext):
     user_id = message.from_user.id
+    
     if user_id not in user_data:
         await message.answer("❌ Сначала зарегистрируйтесь через /start")
         return
+    
     user_type = user_data[user_id].get('type')
     group_type = user_data[user_id].get('group_type', '')
+    
     if group_type == 'correspondence':
         await message.answer("❌ Для заочников расписание по дням недели не предусмотрено.\nИспользуйте кнопку '📋 Консультации'")
         return
+    
     await state.update_data(week_offset=0)
+    
     if user_type == 'student':
-        await message.answer("Выберите день (текущая неделя):", reply_markup=get_day_selection_keyboard('student', 'current'))
+        await message.answer(
+            "Выберите день (текущая неделя):",
+            reply_markup=get_day_selection_keyboard('student', 'current')
+        )
         await state.set_state(States.waiting_for_day)
     else:
-        await message.answer("Выберите день (текущая неделя):", reply_markup=get_day_selection_keyboard('teacher', 'current'))
+        await message.answer(
+            "Выберите день (текущая неделя):",
+            reply_markup=get_day_selection_keyboard('teacher', 'current')
+        )
         await state.set_state(States.waiting_for_teacher_day)
 
 @dp.message(F.text == "📅 Следующая неделя")
 async def next_week_menu(message: Message, state: FSMContext):
     user_id = message.from_user.id
+    
     if user_id not in user_data:
         await message.answer("❌ Сначала зарегистрируйтесь через /start")
         return
+    
     user_type = user_data[user_id].get('type')
     group_type = user_data[user_id].get('group_type', '')
+    
     if group_type == 'correspondence':
         await message.answer("❌ Для заочников расписание по дням недели не предусмотрено.\nИспользуйте кнопку '📋 Консультации'")
         return
+    
     await state.update_data(week_offset=1)
+    
     if user_type == 'student':
-        await message.answer("Выберите день (следующая неделя):", reply_markup=get_day_selection_keyboard('student', 'next'))
+        await message.answer(
+            "Выберите день (следующая неделя):",
+            reply_markup=get_day_selection_keyboard('student', 'next')
+        )
         await state.set_state(States.waiting_for_day)
     else:
-        await message.answer("Выберите день (следующая неделя):", reply_markup=get_day_selection_keyboard('teacher', 'next'))
+        await message.answer(
+            "Выберите день (следующая неделя):",
+            reply_markup=get_day_selection_keyboard('teacher', 'next')
+        )
         await state.set_state(States.waiting_for_teacher_day)
 
 @dp.message(States.waiting_for_day)
@@ -1090,25 +1423,34 @@ async def show_group_schedule(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Главное меню:", reply_markup=get_main_keyboard_student())
         return
+    
     user_id = message.from_user.id
     group_info = user_data[user_id]
     day_name = message.text
     data = await state.get_data()
     week_offset = data.get('week_offset', 0)
+    
     if day_name not in DAYS:
         await message.answer("Пожалуйста, выберите день из меню")
         return
+    
     msg = await message.answer(f"🔍 Загружаю расписание на {day_name}...")
+    
     await schedule.ensure_data_loaded()
     subgroup = group_info.get('subgroup')
     result = schedule.get_day_schedule_fulltime(group_info['group'], subgroup, day_name, week_offset)
     await msg.delete()
+    
     if result:
         await message.answer(result, parse_mode='HTML')
     else:
         week_text = "следующей" if week_offset == 1 else "текущей"
         await message.answer(f"📭 На {day_name} {week_text} недели занятий нет")
-    await message.answer("Выберите другой день:", reply_markup=get_day_selection_keyboard('student', 'current' if week_offset == 0 else 'next'))
+    
+    await message.answer(
+        "Выберите другой день:",
+        reply_markup=get_day_selection_keyboard('student', 'current' if week_offset == 0 else 'next')
+    )
 
 @dp.message(States.waiting_for_teacher_day)
 async def show_teacher_schedule(message: Message, state: FSMContext):
@@ -1120,36 +1462,50 @@ async def show_teacher_schedule(message: Message, state: FSMContext):
         else:
             await message.answer("Главное меню:", reply_markup=get_main_keyboard_student())
         return
+    
     user_id = message.from_user.id
     teacher_name = user_data[user_id].get('teacher_name', '')
     day_name = message.text
     data = await state.get_data()
     week_offset = data.get('week_offset', 0)
+    
     if day_name not in DAYS:
         await message.answer("Пожалуйста, выберите день из меню")
         return
+    
     msg = await message.answer(f"🔍 Загружаю расписание для преподавателя {teacher_name}...")
+    
     await schedule.ensure_data_loaded()
     results = schedule.search_teacher(teacher_name, day_name, week_offset)
     await msg.delete()
+    
     if results:
         formatted = schedule.format_teacher_schedule(results, teacher_name, day_name, week_offset)
         await message.answer(formatted, parse_mode='HTML')
     else:
         week_text = "следующей" if week_offset == 1 else "текущей"
         await message.answer(f"📭 Для преподавателя {teacher_name} на {day_name} {week_text} недели занятий нет")
-    await message.answer("Выберите другой день:", reply_markup=get_day_selection_keyboard('teacher', 'current' if week_offset == 0 else 'next'))
+    
+    await message.answer(
+        "Выберите другой день:",
+        reply_markup=get_day_selection_keyboard('teacher', 'current' if week_offset == 0 else 'next')
+    )
 
 @dp.message(F.text == "🔍 Поиск преподавателя")
 async def student_search_teacher(message: Message, state: FSMContext):
     if message.from_user.id not in user_data:
         await message.answer("❌ Сначала зарегистрируйтесь через /start")
         return
+    
     group_type = user_data[message.from_user.id].get('group_type', '')
     if group_type == 'correspondence':
         await message.answer("❌ Для заочников поиск преподавателя не поддерживается.")
         return
-    await message.answer("👨‍🏫 Введите фамилию преподавателя (например: Иванов, Петрова, Комаров):", reply_markup=get_back_keyboard())
+    
+    await message.answer(
+        "👨‍🏫 Введите фамилию преподавателя (например: Иванов, Петрова, Комаров):",
+        reply_markup=get_back_keyboard()
+    )
     await state.set_state(States.waiting_for_student_teacher_search)
 
 @dp.message(States.waiting_for_student_teacher_search)
@@ -1158,18 +1514,27 @@ async def process_student_teacher_name(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Главное меню:", reply_markup=get_main_keyboard_student())
         return
+    
     teacher_name = message.text.strip()
     await state.update_data(search_teacher_name=teacher_name)
-    await message.answer("📅 Выберите неделю для поиска:", reply_markup=get_week_selection_keyboard())
+    
+    await message.answer(
+        "📅 Выберите неделю для поиска:",
+        reply_markup=get_week_selection_keyboard()
+    )
     await state.set_state(States.waiting_for_student_teacher_week)
 
 @dp.message(States.waiting_for_student_teacher_week)
 async def process_student_teacher_week(message: Message, state: FSMContext):
     if message.text == "◀️ Назад":
         await state.update_data(search_teacher_name=None)
-        await message.answer("👨‍🏫 Введите фамилию преподавателя:", reply_markup=get_back_keyboard())
+        await message.answer(
+            "👨‍🏫 Введите фамилию преподавателя:",
+            reply_markup=get_back_keyboard()
+        )
         await state.set_state(States.waiting_for_student_teacher_search)
         return
+    
     if message.text == "📅 Текущая неделя":
         week_offset = 0
     elif message.text == "📅 Следующая неделя":
@@ -1177,49 +1542,70 @@ async def process_student_teacher_week(message: Message, state: FSMContext):
     else:
         await message.answer("Пожалуйста, выберите неделю из меню")
         return
+    
     await state.update_data(search_week_offset=week_offset)
-    await message.answer("📅 Выберите день для поиска:", reply_markup=get_days_keyboard())
+    
+    await message.answer(
+        "📅 Выберите день для поиска:",
+        reply_markup=get_days_keyboard()
+    )
     await state.set_state(States.waiting_for_student_teacher_day)
 
 @dp.message(States.waiting_for_student_teacher_day)
 async def process_student_teacher_day(message: Message, state: FSMContext):
     if message.text == "◀️ Назад":
-        await message.answer("📅 Выберите неделю для поиска:", reply_markup=get_week_selection_keyboard())
+        await message.answer(
+            "📅 Выберите неделю для поиска:",
+            reply_markup=get_week_selection_keyboard()
+        )
         await state.set_state(States.waiting_for_student_teacher_week)
         return
+    
     day_name = message.text
     if day_name not in DAYS:
         await message.answer("Пожалуйста, выберите день из меню")
         return
+    
     data = await state.get_data()
     teacher_name = data.get('search_teacher_name')
     week_offset = data.get('search_week_offset', 0)
+    
     msg = await message.answer(f"🔍 Ищу преподавателя {teacher_name} на {day_name}...")
+    
     await schedule.ensure_data_loaded()
     results = schedule.search_teacher(teacher_name, day_name, week_offset)
     await msg.delete()
+    
     if results:
         formatted = schedule.format_student_teacher_search(results, teacher_name, day_name, week_offset)
         await message.answer(formatted, parse_mode='HTML')
     else:
         week_text = "следующей" if week_offset == 1 else "текущей"
         await message.answer(f"❌ Преподаватель {teacher_name} не найден на {day_name} {week_text} неделе")
-    await message.answer("Главное меню:", reply_markup=get_main_keyboard_student())
+    
+    await message.answer(
+        "Главное меню:",
+        reply_markup=get_main_keyboard_student()
+    )
     await state.clear()
 
 @dp.message(F.text == "📋 Консультации сегодня")
 async def show_today_consultations(message: Message):
     user_id = message.from_user.id
+    
     if user_id not in user_data:
         await message.answer("❌ Сначала зарегистрируйтесь через /start")
         return
+    
     group_info = user_data[user_id]
     if group_info.get('group_type') != 'correspondence':
         await message.answer("❌ Консультации доступны только для заочников")
         return
+    
     group_name = group_info['group']
     await schedule.ensure_data_loaded()
     result = schedule.get_consultations_for_group(group_name)
+    
     if result:
         await message.answer(result, parse_mode='HTML')
     else:
@@ -1228,16 +1614,20 @@ async def show_today_consultations(message: Message):
 @dp.message(F.text == "📋 Все консультации")
 async def show_all_consultations(message: Message):
     user_id = message.from_user.id
+    
     if user_id not in user_data:
         await message.answer("❌ Сначала зарегистрируйтесь через /start")
         return
+    
     group_info = user_data[user_id]
     if group_info.get('group_type') != 'correspondence':
         await message.answer("❌ Консультации доступны только для заочников")
         return
+    
     group_name = group_info['group']
     await schedule.ensure_data_loaded()
     result = schedule.get_consultations_for_group(group_name)
+    
     if result:
         await message.answer(result, parse_mode='HTML')
     else:
@@ -1246,28 +1636,36 @@ async def show_all_consultations(message: Message):
 @dp.message(F.text == "📋 Список групп")
 async def show_groups(message: Message):
     await schedule.ensure_data_loaded()
+    
     all_groups = []
+    
     for group in schedule.fulltime_base_groups:
         subgroups = schedule.get_subgroups(group)
         if subgroups:
             all_groups.append(f"{group} (очное, подгруппы: {', '.join(map(str, subgroups))})")
         else:
             all_groups.append(f"{group} (очное)")
+    
     for group in schedule.correspondence_groups:
         all_groups.append(f"{group} (заочное)")
+    
     if not all_groups:
         await message.answer("⏳ Группы не загружены. Нажмите '🔄 Обновить'")
         return
+    
     text = "📚 <b>ВСЕ ГРУППЫ</b>\n\n"
     for group in all_groups:
         if len(text) + len(group) + 10 > 3500:
             await message.answer(text, parse_mode='HTML')
             text = "📚 <b>ПРОДОЛЖЕНИЕ</b>\n\n"
         text += f"• {group}\n"
+    
     if text:
         await message.answer(text, parse_mode='HTML')
+    
     user_type = user_data.get(message.from_user.id, {}).get('type', 'student')
     group_type = user_data.get(message.from_user.id, {}).get('group_type', '')
+    
     if user_type == 'teacher':
         await message.answer(f"✅ Всего групп: {len(all_groups)}", reply_markup=get_main_keyboard_teacher())
     else:
@@ -1281,9 +1679,12 @@ async def update_data(message: Message):
     msg = await message.answer("🔄 Обновляю данные...")
     await schedule.ensure_data_loaded()
     await msg.delete()
+    
     text = f"📊 <b>РЕЗУЛЬТАТ</b>\n\n✅ Данные обновлены: {schedule.last_update.strftime('%d.%m.%Y %H:%M:%S') if schedule.last_update else 'только что'}"
+    
     user_type = user_data.get(message.from_user.id, {}).get('type', 'student')
     group_type = user_data.get(message.from_user.id, {}).get('group_type', '')
+    
     if user_type == 'teacher' or group_type == 'correspondence':
         await message.answer(text, parse_mode='HTML', reply_markup=get_main_keyboard_teacher())
     else:
@@ -1294,8 +1695,12 @@ async def change_user(message: Message, state: FSMContext):
     user_id = message.from_user.id
     if user_id in user_data:
         del user_data[user_id]
+    
     await state.clear()
-    await message.answer("👋 Вы сменили пользователя.\n\nВы студент или преподаватель?", reply_markup=get_user_type_keyboard())
+    await message.answer(
+        "👋 Вы сменили пользователя.\n\nВы студент или преподаватель?",
+        reply_markup=get_user_type_keyboard()
+    )
     await state.set_state(States.waiting_for_user_type)
 
 @dp.message(F.text == "◀️ Назад")
@@ -1303,6 +1708,7 @@ async def back_to_menu(message: Message, state: FSMContext):
     await state.clear()
     user_type = user_data.get(message.from_user.id, {}).get('type', 'student')
     group_type = user_data.get(message.from_user.id, {}).get('group_type', '')
+    
     if user_type == 'teacher':
         await message.answer("Главное меню:", reply_markup=get_main_keyboard_teacher())
     else:
@@ -1316,34 +1722,25 @@ async def main():
     print("🤖 Запуск бота...")
     global bot
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    
     await schedule.start()
     await schedule.ensure_data_loaded()
-    me = await bot.get_me()
-    print(f"✅ Бот @{me.username} успешно подключён к Telegram API")
+    
+    try:
+        me = await bot.get_me()
+        print(f"✅ Бот @{me.username} успешно подключён к Telegram API")
+    except Exception as e:
+        print(f"❌ Ошибка подключения: {e}")
+        print("💡 Возможные решения: отключите антивирус, включите VPN")
+        return
+    
     today = get_today_name()
     week_display, _, _ = get_week_type()
     print(f"📅 Сегодня: {today}")
     print(f"📅 Текущая неделя: {week_display}")
     print(f"✅ Бот готов!")
+    
     await dp.start_polling(bot)
-from aiohttp import web
 
-PORT = int(os.environ.get('PORT', 10000))
-
-async def health_check(request):
-    return web.Response(text="Bot is running!")
-
-async def start_web():
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    print(f"🌐 Веб-сервер запущен на порту {PORT}")
-
-async def main():
-    await start_web()  # Добавить эту строку
-    # ... остальной код
 if __name__ == '__main__':
     asyncio.run(main())
